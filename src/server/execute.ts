@@ -85,21 +85,32 @@ Title: {{taskTitle}}
 3. Report what you did
 {{/taskId}}
 
+{{#commentId}}
+## Comment on This Issue
+
+Someone commented on the issue you're working on. Read the comment:
+   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
+
+Address the comment, reply if needed, and continue working on the issue.
+{{/commentId}}
+
 {{#noTask}}
 ## Heartbeat Wake — Check for Work
 
-1. List issues assigned to you:
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}&status=todo" | python3 -m json.tool\`
+1. List ALL open issues assigned to you (todo, backlog, in_progress):
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
 
-2. If issues found, pick the highest priority one and work on it:
-   - Checkout: \`curl -s -X POST "{{paperclipApiUrl}}/issues/ISSUE_ID/checkout" -H "Content-Type: application/json" -d '{"agentId":"{{agentId}}"}'\`
-   - Do the work
-   - Complete: \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
+   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
+   - Do the work in the project directory: {{projectName}}
+   - When done, mark complete: \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"status":"done"}'\`
 
-3. If no issues found, check for any unassigned issues:
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -m json.tool\`
+3. If no issues assigned to you, check for unassigned issues:
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+   If you find a relevant issue, assign it to yourself:
+   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
 
-4. If truly nothing to do, report briefly.
+4. If truly nothing to do, report briefly what you checked.
 {{/noTask}}`;
 
 function buildPrompt(
@@ -111,6 +122,8 @@ function buildPrompt(
   const taskId = cfgString(ctx.config?.taskId);
   const taskTitle = cfgString(ctx.config?.taskTitle) || "";
   const taskBody = cfgString(ctx.config?.taskBody) || "";
+  const commentId = cfgString(ctx.config?.commentId) || "";
+  const wakeReason = cfgString(ctx.config?.wakeReason) || "";
   const agentName = ctx.agent?.name || "Hermes Agent";
   const companyName = cfgString(ctx.config?.companyName) || "";
   const projectName = cfgString(ctx.config?.projectName) || "";
@@ -134,6 +147,8 @@ function buildPrompt(
     taskId: taskId || "",
     taskTitle,
     taskBody,
+    commentId,
+    wakeReason,
     projectName,
     paperclipApiUrl,
   };
@@ -151,6 +166,12 @@ function buildPrompt(
   rendered = rendered.replace(
     /\{\{#noTask\}\}([\s\S]*?)\{\{\/noTask\}\}/g,
     taskId ? "" : "$1",
+  );
+
+  // {{#commentId}}...{{/commentId}} — include if comment exists
+  rendered = rendered.replace(
+    /\{\{#commentId\}\}([\s\S]*?)\{\{\/commentId\}\}/g,
+    commentId ? "$1" : "",
   );
 
   // Replace remaining {{variable}} placeholders
@@ -329,12 +350,35 @@ export async function execute(
   }
 
   // ── Execute ────────────────────────────────────────────────────────────
+  // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
+  // Paperclip renders all stderr as red/error in the UI.
+  // Wrap onLog to reclassify benign stderr lines as stdout.
+  const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+    if (stream === "stderr") {
+      const trimmed = chunk.trimEnd();
+      // Benign patterns that should NOT appear as errors:
+      // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
+      // - MCP server registration messages
+      // - Python import/site noise
+      const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
+        /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
+        /Successfully registered all tools/.test(trimmed) ||
+        /MCP [Ss]erver/.test(trimmed) ||
+        /tool registered successfully/.test(trimmed) ||
+        /Application initialized/.test(trimmed);
+      if (isBenign) {
+        return ctx.onLog("stdout", chunk);
+      }
+    }
+    return ctx.onLog(stream, chunk);
+  };
+
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
     timeoutSec,
     graceSec,
-    onLog: ctx.onLog,
+    onLog: wrappedOnLog,
   });
 
   // ── Parse output ───────────────────────────────────────────────────────
@@ -373,6 +417,14 @@ export async function execute(
   if (parsed.response) {
     executionResult.summary = parsed.response.slice(0, 2000);
   }
+
+  // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
+  executionResult.resultJson = {
+    result: parsed.response || "",
+    session_id: parsed.sessionId || null,
+    usage: parsed.usage || null,
+    cost_usd: parsed.costUsd ?? null,
+  };
 
   // Store session ID for next run
   if (persistSession && parsed.sessionId) {
