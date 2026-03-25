@@ -82,24 +82,38 @@ Title: {{taskTitle}}
 1. Work on the task using your tools
 2. When done, mark the issue as completed:
    \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -d '{"status":"done"}'\`
-3. Report what you did
+3. Post a completion comment on the issue summarizing what you did:
+   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
+4. If this issue has a parent (check the issue body or comments for references like TRA-XX), post a brief notification on the parent issue so the parent owner knows:
+   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
 {{/taskId}}
+
+{{#commentId}}
+## Comment on This Issue
+
+Someone commented. Read it:
+   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
+
+Address the comment, POST a reply if needed, then continue working.
+{{/commentId}}
 
 {{#noTask}}
 ## Heartbeat Wake — Check for Work
 
-1. List issues assigned to you:
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}&status=todo" | python3 -m json.tool\`
+1. List ALL open issues assigned to you (todo, backlog, in_progress):
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
 
-2. If issues found, pick the highest priority one and work on it:
-   - Checkout: \`curl -s -X POST "{{paperclipApiUrl}}/issues/ISSUE_ID/checkout" -H "Content-Type: application/json" -d '{"agentId":"{{agentId}}"}'\`
-   - Do the work
-   - Complete: \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
+   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
+   - Do the work in the project directory: {{projectName}}
+   - When done, mark complete and post a comment (see Workflow steps 2-4 above)
 
-3. If no issues found, check for any unassigned issues:
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -m json.tool\`
+3. If no issues assigned to you, check for unassigned issues:
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+   If you find a relevant issue, assign it to yourself:
+   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
 
-4. If truly nothing to do, report briefly.
+4. If truly nothing to do, report briefly what you checked.
 {{/noTask}}`;
 
 function buildPrompt(
@@ -111,6 +125,8 @@ function buildPrompt(
   const taskId = cfgString(ctx.config?.taskId);
   const taskTitle = cfgString(ctx.config?.taskTitle) || "";
   const taskBody = cfgString(ctx.config?.taskBody) || "";
+  const commentId = cfgString(ctx.config?.commentId) || "";
+  const wakeReason = cfgString(ctx.config?.wakeReason) || "";
   const agentName = ctx.agent?.name || "Hermes Agent";
   const companyName = cfgString(ctx.config?.companyName) || "";
   const projectName = cfgString(ctx.config?.projectName) || "";
@@ -134,6 +150,8 @@ function buildPrompt(
     taskId: taskId || "",
     taskTitle,
     taskBody,
+    commentId,
+    wakeReason,
     projectName,
     paperclipApiUrl,
   };
@@ -151,6 +169,12 @@ function buildPrompt(
   rendered = rendered.replace(
     /\{\{#noTask\}\}([\s\S]*?)\{\{\/noTask\}\}/g,
     taskId ? "" : "$1",
+  );
+
+  // {{#commentId}}...{{/commentId}} — include if comment exists
+  rendered = rendered.replace(
+    /\{\{#commentId\}\}([\s\S]*?)\{\{\/commentId\}\}/g,
+    commentId ? "$1" : "",
   );
 
   // Replace remaining {{variable}} placeholders
@@ -182,6 +206,39 @@ interface ParsedOutput {
   errorMessage?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Response cleaning
+// ---------------------------------------------------------------------------
+
+/** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
+function cleanResponse(raw: string): string {
+  return raw
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      if (!t) return true; // keep blank lines for paragraph separation
+      if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
+      if (t.startsWith("session_id:")) return false;
+      if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
+      if (/^\[done\]\s*┊/.test(t)) return false;
+      if (/^┊\s*[\p{Emoji_Presentation}]/u.test(t) && !/^┊\s*💬/.test(t)) return false;
+      if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t)) return false;
+      return true;
+    })
+    .map((line) => {
+      let t = line.replace(/^[\s]*┊\s*💬\s*/, "").trim();
+      t = t.replace(/^\[done\]\s*/, "").trim();
+      return t;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// ---------------------------------------------------------------------------
+// Output parsing
+// ---------------------------------------------------------------------------
+
 function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
@@ -192,17 +249,42 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //   session_id: <id>
   const sessionMatch = stdout.match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch[1];
+    result.sessionId = sessionMatch?.[1] ?? null;
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
-      result.response = stdout.slice(0, sessionLineIdx).trim();
+      result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
     }
   } else {
     // Legacy format (non-quiet mode)
     const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
     if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch[1];
+      result.sessionId = legacyMatch?.[1] ?? null;
+    }
+    // In non-quiet mode, extract clean response from stdout by
+    // filtering out tool lines, system messages, and noise
+    const cleanLines = stdout
+      .split("\n")
+      .filter((line) => {
+        const t = line.trim();
+        if (!t) return false;
+        if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
+        if (t.startsWith("session_id:")) return false;
+        if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false; // timestamp logs
+        if (/^\[done\]\s*┊/.test(t)) return false; // done tool lines
+        if (/^┊\s*[\p{Emoji_Presentation}]/u.test(t) && !/^┊\s*💬/.test(t)) return false; // tool ┊ lines (not assistant)
+        if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t)) return false; // spinner remnants
+        return true;
+      })
+      .map((line) => {
+        // Strip ┊ 💬 prefix from assistant lines
+        let t = line.replace(/^[\s]*┊\s*💬\s*/, "").trim();
+        // Strip [done] prefix
+        t = t.replace(/^\[done\]\s*/, "").trim();
+        return t;
+      });
+    if (cleanLines.length > 0) {
+      result.response = cleanLines.join("\n");
     }
   }
 
@@ -329,12 +411,35 @@ export async function execute(
   }
 
   // ── Execute ────────────────────────────────────────────────────────────
+  // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
+  // Paperclip renders all stderr as red/error in the UI.
+  // Wrap onLog to reclassify benign stderr lines as stdout.
+  const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+    if (stream === "stderr") {
+      const trimmed = chunk.trimEnd();
+      // Benign patterns that should NOT appear as errors:
+      // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
+      // - MCP server registration messages
+      // - Python import/site noise
+      const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
+        /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
+        /Successfully registered all tools/.test(trimmed) ||
+        /MCP [Ss]erver/.test(trimmed) ||
+        /tool registered successfully/.test(trimmed) ||
+        /Application initialized/.test(trimmed);
+      if (isBenign) {
+        return ctx.onLog("stdout", chunk);
+      }
+    }
+    return ctx.onLog(stream, chunk);
+  };
+
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
     timeoutSec,
     graceSec,
-    onLog: ctx.onLog,
+    onLog: wrappedOnLog,
   });
 
   // ── Parse output ───────────────────────────────────────────────────────
@@ -373,6 +478,14 @@ export async function execute(
   if (parsed.response) {
     executionResult.summary = parsed.response.slice(0, 2000);
   }
+
+  // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
+  executionResult.resultJson = {
+    result: parsed.response || "",
+    session_id: parsed.sessionId || null,
+    usage: parsed.usage || null,
+    cost_usd: parsed.costUsd ?? null,
+  };
 
   // Store session ID for next run
   if (persistSession && parsed.sessionId) {
