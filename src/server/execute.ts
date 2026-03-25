@@ -206,6 +206,39 @@ interface ParsedOutput {
   errorMessage?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Response cleaning
+// ---------------------------------------------------------------------------
+
+/** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
+function cleanResponse(raw: string): string {
+  return raw
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      if (!t) return true; // keep blank lines for paragraph separation
+      if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
+      if (t.startsWith("session_id:")) return false;
+      if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
+      if (/^\[done\]\s*┊/.test(t)) return false;
+      if (/^┊\s*[\p{Emoji_Presentation}]/u.test(t) && !/^┊\s*💬/.test(t)) return false;
+      if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t)) return false;
+      return true;
+    })
+    .map((line) => {
+      let t = line.replace(/^[\s]*┊\s*💬\s*/, "").trim();
+      t = t.replace(/^\[done\]\s*/, "").trim();
+      return t;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+// ---------------------------------------------------------------------------
+// Output parsing
+// ---------------------------------------------------------------------------
+
 function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
@@ -216,17 +249,42 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //   session_id: <id>
   const sessionMatch = stdout.match(SESSION_ID_REGEX);
   if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch[1];
+    result.sessionId = sessionMatch?.[1] ?? null;
     // The response is everything before the session_id line
     const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
     if (sessionLineIdx > 0) {
-      result.response = stdout.slice(0, sessionLineIdx).trim();
+      result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
     }
   } else {
     // Legacy format (non-quiet mode)
     const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
     if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch[1];
+      result.sessionId = legacyMatch?.[1] ?? null;
+    }
+    // In non-quiet mode, extract clean response from stdout by
+    // filtering out tool lines, system messages, and noise
+    const cleanLines = stdout
+      .split("\n")
+      .filter((line) => {
+        const t = line.trim();
+        if (!t) return false;
+        if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
+        if (t.startsWith("session_id:")) return false;
+        if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false; // timestamp logs
+        if (/^\[done\]\s*┊/.test(t)) return false; // done tool lines
+        if (/^┊\s*[\p{Emoji_Presentation}]/u.test(t) && !/^┊\s*💬/.test(t)) return false; // tool ┊ lines (not assistant)
+        if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t)) return false; // spinner remnants
+        return true;
+      })
+      .map((line) => {
+        // Strip ┊ 💬 prefix from assistant lines
+        let t = line.replace(/^[\s]*┊\s*💬\s*/, "").trim();
+        // Strip [done] prefix
+        t = t.replace(/^\[done\]\s*/, "").trim();
+        return t;
+      });
+    if (cleanLines.length > 0) {
+      result.response = cleanLines.join("\n");
     }
   }
 

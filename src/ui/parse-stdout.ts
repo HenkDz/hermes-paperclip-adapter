@@ -19,7 +19,7 @@ import { TOOL_OUTPUT_PREFIX } from "../shared/constants.js";
 
 /** Matches common kawaii faces used by Hermes spinners. */
 const KAOMOJI_RE =
-  /[\u2600-\u27BF\u2B50-\u2B55\u2702-\u27B0\u{1F300}-\u{1F9FF}\u{200D}\uFE0F\u200C\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}]|[(][^()]{2,12}[)]|[(][^()]{2,12}[)]/gu;
+  /(?:[\u2600-\u27BF\u2B50-\u2B55\u2702-\u27B0\u{1F300}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}]|\u{200D}|\uFE0F|\u200C|[(][^()]{2,12}[)])/gu;
 
 /**
  * Strip kawaii faces and decorative emoji from a tool summary line.
@@ -93,9 +93,9 @@ function parseToolCompletionLine(
 
   // Map Hermes verbs to readable tool names
   const nameMap: Record<string, string> = {
-    "$": "terminal",
-    "exec": "terminal",
-    "terminal": "terminal",
+    "$": "shell",
+    "exec": "shell",
+    "terminal": "shell",
     "search": "search",
     "fetch": "fetch",
     "crawl": "crawl",
@@ -191,7 +191,32 @@ export function parseHermesStdoutLine(
   if (!trimmed) return [];
 
   // ── System/adapter messages ────────────────────────────────────────────
-  if (trimmed.startsWith("[hermes]")) {
+  if (trimmed.startsWith("[hermes]") || trimmed.startsWith("[paperclip]")) {
+    return [{ kind: "system", ts, text: trimmed }];
+  }
+
+  // ── Non-quiet mode tool start lines: [tool] (kaomoji) emoji verb ... ──
+  // These are redundant — the tool_call/tool_result pair arrives later from
+  // the ┊ completion line. Skip them to avoid duplicate entries.
+  if (trimmed.startsWith("[tool]")) {
+    return [];
+  }
+
+  // ── MCP / server init noise reclassified from stderr by wrappedOnLog ──
+  // Pattern: [2026-03-25T10:40:53.941Z] INFO: ...
+  // Emit as stderr so Paperclip groups them into the amber accordion.
+  if (/^\[\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
+    return [{ kind: "stderr", ts, text: trimmed }];
+  }
+
+  // ── Standalone spinner remnants: "💻 Completed", "💻\nCompleted", etc. ─
+  // These are non-quiet mode spinner frame leftovers — skip them.
+  if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(trimmed)) {
+    return [];
+  }
+
+  // ── Session info line ────────────────────────────────────────────────
+  if (trimmed.startsWith("session_id:")) {
     return [{ kind: "system", ts, text: trimmed }];
   }
 
