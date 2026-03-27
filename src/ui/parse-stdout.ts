@@ -17,10 +17,6 @@ import { TOOL_OUTPUT_PREFIX } from "../shared/constants.js";
 
 // ── Kaomoji / noise stripping ──────────────────────────────────────────────
 
-/** Matches common kawaii faces used by Hermes spinners. */
-const KAOMOJI_RE =
-  /(?:[\u2600-\u27BF\u2B50-\u2B55\u2702-\u27B0\u{1F300}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}]|\u{200D}|\uFE0F|\u200C|[(][^()]{2,12}[)])/gu;
-
 /**
  * Strip kawaii faces and decorative emoji from a tool summary line.
  * Leaves meaningful emoji (💻 for terminal, 🔍 for search, etc.) intact

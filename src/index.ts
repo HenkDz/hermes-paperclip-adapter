@@ -20,11 +20,6 @@ export const label = ADAPTER_LABEL;
  * Hermes supports any model via any provider — the list is empty
  * and the UI uses detectModel() + free-text input instead.
  */
-/**
- * Hermes supports any model via any provider — no fixed list.
- * The UI uses detectModel() to show the user's current config
- * and allows free-text input for any model ID.
- */
 export const models: { id: string; label: string }[] = [];
 
 /**
