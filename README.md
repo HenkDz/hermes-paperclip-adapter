@@ -1,10 +1,26 @@
 # Paperclip Adapter for Hermes Agent
 
-A [Paperclip](https://paperclip.ing) adapter that lets you run [Hermes Agent](https://github.com/NousResearch/hermes-agent) as a managed employee in a Paperclip company.
+An enhanced [Paperclip](https://paperclip.ing) adapter that lets you run [Hermes Agent](https://github.com/NousResearch/hermes-agent) as a managed employee in a Paperclip company.
 
-Hermes Agent is a full-featured AI agent by [Nous Research](https://nousresearch.com) with 30+ native tools, persistent memory, session persistence, 80+ skills, MCP support, and multi-provider model access.
+Built on top of Hermes Agent by [Nous Research](https://nousresearch.com), this fork extends the adapter with richer Paperclip integration, broader provider support, and production-hardened output handling.
 
-## Why Hermes Agent?
+## Why This Fork?
+
+This adapter goes beyond the upstream Nous adapter with:
+
+- **8 inference providers** — Anthropic, OpenRouter, OpenAI, Nous, OpenAI Codex, ZAI, Kimi Coding, MiniMax
+- **Skills integration** — Scans both Paperclip-managed and Hermes-native skills (`~/.hermes/skills/`), with sync/list/resolve APIs
+- **Structured transcript parsing** — Raw Hermes stdout is parsed into typed `TranscriptEntry` objects so Paperclip renders proper tool cards with status icons and expand/collapse
+- **Rich post-processing** — Converts Hermes ASCII banners, setext headings, and `+--+` table borders into clean GFM markdown
+- **Comment-driven wakes** — Agents wake to respond to issue comments, not just task assignments
+- **Auto model detection** — Reads `~/.hermes/config.yaml` to pre-populate the UI with the user's configured model
+- **Session codec** — Structured validation and migration of session state across heartbeats
+- **Benign stderr reclassification** — MCP init messages and structured logs are reclassified so they don't appear as errors in the UI
+- **Session source tagging** — Sessions are tagged as `tool` source so they don't clutter the user's interactive history
+- **Filesystem checkpoints** — Optional `--checkpoints` for rollback safety
+- **Thinking effort control** — Passes `--reasoning-effort` for thinking/reasoning models
+
+### Hermes Agent Capabilities
 
 | Feature | Claude Code | Codex | Hermes Agent |
 |---------|------------|-------|-------------|
@@ -15,12 +31,12 @@ Hermes Agent is a full-featured AI agent by [Nous Research](https://nousresearch
 | Sub-agent delegation | ❌ | ❌ | ✅ Parallel sub-tasks |
 | Context compression | ❌ | ❌ | ✅ Auto-compresses long conversations |
 | MCP client | ❌ | ❌ | ✅ Connect to any MCP server |
-| Multi-provider | Anthropic only | OpenAI only | ✅ Anthropic, OpenAI, OpenRouter, Google |
+| Multi-provider | Anthropic only | OpenAI only | ✅ 8 providers out of the box |
 
 ## Installation
 
 ```bash
-npm install @nousresearch/paperclip-adapter-hermes
+npm install @henkey/hermes-paperclip-adapter
 ```
 
 ### Prerequisites
@@ -36,13 +52,24 @@ npm install @nousresearch/paperclip-adapter-hermes
 Add to your Paperclip server's adapter registry (`server/src/adapters/registry.ts`):
 
 ```typescript
-import * as hermesLocal from "@nousresearch/paperclip-adapter-hermes";
-import { execute, testEnvironment } from "@nousresearch/paperclip-adapter-hermes/server";
+import * as hermesLocal from "@henkey/hermes-paperclip-adapter";
+import {
+  execute,
+  testEnvironment,
+  detectModel,
+  listSkills,
+  syncSkills,
+  sessionCodec,
+} from "@henkey/hermes-paperclip-adapter/server";
 
 registry.set("hermes_local", {
   ...hermesLocal,
   execute,
   testEnvironment,
+  detectModel,
+  listSkills,
+  syncSkills,
+  sessionCodec,
 });
 ```
 
@@ -80,8 +107,7 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `model` | string | `anthropic/claude-sonnet-4` | Model in `provider/model` format |
-| `provider` | string | *(auto-detected)* | API provider override |
-| `maxIterations` | number | `50` | Max tool-calling iterations per run |
+| `provider` | string | *(auto-detected)* | API provider: `auto`, `openrouter`, `nous`, `openai-codex`, `zai`, `kimi-coding`, `minimax`, `minimax-cn` |
 | `timeoutSec` | number | `300` | Execution timeout in seconds |
 | `graceSec` | number | `10` | Grace period before SIGKILL |
 
@@ -89,28 +115,29 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabledToolsets` | string[] | *(all)* | Toolsets to enable |
-| `disabledToolsets` | string[] | `[]` | Toolsets to disable |
+| `toolsets` | string | *(all)* | Comma-separated toolsets to enable (e.g. `"terminal,file,web"`) |
 
 Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vision`, `mcp`, `creative`, `productivity`
 
-### Session & Memory
+### Session & Workspace
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `persistSession` | boolean | `true` | Resume sessions across heartbeats |
-| `skipMemory` | boolean | `false` | Disable persistent memory |
 | `worktreeMode` | boolean | `false` | Git worktree isolation |
+| `checkpoints` | boolean | `false` | Enable filesystem checkpoints for rollback |
 
 ### Advanced
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `hermesCommand` | string | `hermes` | Custom CLI binary path |
-| `contextFiles` | string[] | `[]` | Extra context files to load |
+| `verbose` | boolean | `false` | Enable verbose output |
+| `quiet` | boolean | `true` | Quiet mode (clean output, no banner/spinner) |
 | `extraArgs` | string[] | `[]` | Additional CLI arguments |
 | `env` | object | `{}` | Extra environment variables |
 | `promptTemplate` | string | *(built-in)* | Custom prompt template |
+| `paperclipApiUrl` | string | `http://127.0.0.1:3100/api` | Paperclip API base URL |
 
 ### Prompt Template Variables
 
@@ -127,10 +154,15 @@ Use `{{variable}}` syntax in `promptTemplate`:
 | `{{taskTitle}}` | Task title |
 | `{{taskBody}}` | Task instructions |
 | `{{projectName}}` | Project name |
+| `{{paperclipApiUrl}}` | Paperclip API base URL |
+| `{{commentId}}` | Comment ID (when woken by a comment) |
+| `{{wakeReason}}` | Reason this run was triggered |
 
 Conditional sections:
+
 - `{{#taskId}}...{{/taskId}}` — included only when a task is assigned
 - `{{#noTask}}...{{/noTask}}` — included only when no task (heartbeat check)
+- `{{#commentId}}...{{/commentId}}` — included only when woken by a comment
 
 ## Architecture
 
@@ -141,26 +173,44 @@ Paperclip                          Hermes Agent
 │  Scheduler       │───execute()──▶│  hermes chat -q  │
 │                  │               │                  │
 │  Issue System    │               │  30+ Tools       │
-│                  │◀──results─────│  Memory System   │
-│  Cost Tracking   │               │  Session DB      │
-│                  │               │  Skills          │
-│  Org Chart       │               │  MCP Client      │
+│  Comment Wakes   │◀──results─────│  Memory System   │
+│                  │               │  Session DB      │
+│  Cost Tracking   │               │  Skills          │
+│                  │               │  MCP Client      │
+│  Skill Sync      │◀──snapshot────│  ~/.hermes/skills│
+│  Org Chart       │               │                  │
 └──────────────────┘               └──────────────────┘
 ```
 
 The adapter spawns Hermes Agent's CLI in single-query mode (`-q`). Hermes
-processes the task using its full tool suite, then exits. The adapter
-captures stdout/stderr, parses token usage and session IDs, and reports
-results back to Paperclip.
+processes the task using its full tool suite, then exits. The adapter:
+
+1. **Captures** stdout/stderr and parses token usage, session IDs, and cost
+2. **Parses** raw output into structured `TranscriptEntry` objects (tool cards with status icons)
+3. **Post-processes** Hermes ASCII formatting (banners, setext headings, table borders) into clean GFM markdown
+4. **Reclassifies** benign stderr (MCP init, structured logs) so they don't show as errors
+5. **Tags** sessions as `tool` source to keep them separate from interactive usage
+6. **Reports** results back to Paperclip with cost, usage, and session state
 
 Session persistence works via Hermes's `--resume` flag — each run picks
 up where the last one left off, maintaining conversation context,
-memories, and tool state across heartbeats.
+memories, and tool state across heartbeats. The `sessionCodec` validates
+and migrates session state between runs.
+
+### Skills Integration
+
+The adapter scans two skill sources and merges them:
+
+- **Paperclip-managed skills** — bundled with the adapter, togglable from the UI
+- **Hermes-native skills** — from `~/.hermes/skills/`, read-only, always loaded
+
+The `listSkills` / `syncSkills` APIs expose a unified snapshot so the
+Paperclip UI can display both managed and native skills in one view.
 
 ## Development
 
 ```bash
-git clone https://github.com/NousResearch/hermes-paperclip-adapter
+git clone https://github.com/HenkDz/hermes-paperclip-adapter
 cd hermes-paperclip-adapter
 npm install
 npm run build
@@ -169,6 +219,10 @@ npm run build
 ## License
 
 MIT — see [LICENSE](LICENSE)
+
+## Credits
+
+This adapter is built on top of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by [Nous Research](https://nousresearch.com). The upstream adapter repository is at [NousResearch/hermes-paperclip-adapter](https://github.com/NousResearch/hermes-paperclip-adapter).
 
 ## Links
 
