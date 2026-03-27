@@ -14,7 +14,7 @@ import type {
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE } from "../shared/constants.js";
+import { HERMES_CLI, ADAPTER_TYPE } from "../shared/constants.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -117,8 +117,9 @@ function checkModel(
   if (!model) {
     return {
       level: "info",
-      message: `No model specified — will use default: ${DEFAULT_MODEL}`,
-      code: "hermes_default_model",
+      message: "No model specified — Hermes will use its configured default model",
+      hint: "Set a model explicitly in Paperclip only if you want to override your local Hermes configuration.",
+      code: "hermes_configured_default_model",
     };
   }
   return {
