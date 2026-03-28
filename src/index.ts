@@ -17,19 +17,11 @@ export const label = ADAPTER_LABEL;
 /**
  * Models available through Hermes Agent.
  *
- * Hermes supports any model via OpenRouter, Anthropic, or OpenAI APIs.
- * This list contains commonly used defaults — the actual available models
- * depend on the user's configured API keys and provider.
+ * Hermes supports any model via any provider. The Paperclip UI should
+ * prefer detectModel() plus manual entry over curated placeholder models,
+ * since Hermes availability depends on the user's local configuration.
  */
-export const models: { id: string; label: string }[] = [
-  { id: "anthropic/claude-sonnet-4", label: "Claude Sonnet 4 (Anthropic)" },
-  { id: "anthropic/claude-opus-4", label: "Claude Opus 4 (Anthropic)" },
-  { id: "openai/gpt-4.1", label: "GPT-4.1 (OpenAI)" },
-  { id: "openai/o3", label: "o3 (OpenAI)" },
-  { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro (Google)" },
-  { id: "deepseek/deepseek-r1", label: "DeepSeek R1" },
-  { id: "anthropic/claude-haiku-3.5", label: "Claude Haiku 3.5 (Anthropic)" },
-];
+export const models: { id: string; label: string }[] = [];
 
 /**
  * Documentation shown in the Paperclip UI when configuring a Hermes agent.
@@ -49,7 +41,7 @@ tools, persistent memory, session persistence, skills, and MCP support.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| model | string | anthropic/claude-sonnet-4 | Model to use (provider/model format) |
+| model | string | (Hermes configured default) | Optional explicit model in provider/model format. Leave blank to use Hermes's configured default model. |
 | provider | string | (auto) | API provider: auto, openrouter, nous, openai-codex, zai, kimi-coding, minimax, minimax-cn. Usually not needed — Hermes auto-detects from model name. |
 | timeoutSec | number | 300 | Execution timeout in seconds |
 | graceSec | number | 10 | Grace period after SIGTERM before SIGKILL |
