@@ -14,6 +14,8 @@
  *   -w/--worktree      isolated git worktree
  *   -v/--verbose       verbose output
  *   --checkpoints      filesystem checkpoints
+ *   --yolo             bypass dangerous-command approval prompts (agents have no TTY)
+ *   --source           session source tag for filtering
  */
 
 import type {
@@ -33,8 +35,14 @@ import {
   HERMES_CLI,
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
+  DEFAULT_MODEL,
   VALID_PROVIDERS,
 } from "../shared/constants.js";
+
+import {
+  detectModel,
+  resolveProvider,
+} from "./detect-model.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -308,8 +316,7 @@ export async function execute(
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
-  const model = cfgString(config.model);
-  const provider = cfgString(config.provider);
+  const model = cfgString(config.model) || DEFAULT_MODEL;
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
@@ -317,6 +324,34 @@ export async function execute(
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
+
+  // ── Resolve provider (defense in depth) ────────────────────────────────
+  // Priority chain:
+  //   1. Explicit provider in adapterConfig (user override)
+  //   2. Provider from ~/.hermes/config.yaml (detected at runtime)
+  //   3. Provider inferred from model name prefix
+  //   4. "auto" (let Hermes decide)
+  //
+  // This ensures that even if the agent was created before provider tracking
+  // was added, or if the model was changed without updating provider, the
+  // correct provider is still used.
+  let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
+  const explicitProvider = cfgString(config.provider);
+
+  if (!explicitProvider) {
+    try {
+      detectedConfig = await detectModel();
+    } catch {
+      // Non-fatal — detection failure shouldn't block execution
+    }
+  }
+
+  const { provider: resolvedProvider, resolvedFrom } = resolveProvider({
+    explicitProvider,
+    detectedProvider: detectedConfig?.provider,
+    detectedModel: detectedConfig?.model,
+    model,
+  });
 
   // ── Build prompt ───────────────────────────────────────────────────────
   const prompt = buildPrompt(ctx, config);
@@ -331,9 +366,10 @@ export async function execute(
     args.push("-m", model);
   }
 
-  // Only pass --provider if it's a valid Hermes provider choice.
-  if (provider && (VALID_PROVIDERS as readonly string[]).includes(provider)) {
-    args.push("--provider", provider);
+  // Always pass --provider when we have a resolved one (not "auto").
+  // "auto" means Hermes will decide on its own — no need to pass it.
+  if (resolvedProvider !== "auto") {
+    args.push("--provider", resolvedProvider);
   }
 
   if (toolsets) {
@@ -347,6 +383,13 @@ export async function execute(
   // Tag sessions as "tool" source so they don't clutter the user's session history.
   // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
   args.push("--source", "tool");
+
+  // Bypass Hermes dangerous-command approval prompts.
+  // Paperclip agents run as non-interactive subprocesses with no TTY,
+  // so approval prompts would always timeout and deny legitimate commands
+  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
+  // system is designed for human-attended interactive sessions.
+  args.push("--yolo");
 
   // Session resume
   const prevSessionId = cfgString(
@@ -387,7 +430,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model ?? "configured-default"}, timeout=${timeoutSec}s)\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s)\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(
@@ -444,8 +487,8 @@ export async function execute(
     exitCode: result.exitCode,
     signal: result.signal,
     timedOut: result.timedOut,
-    provider: provider || null,
-    model: model || null,
+    provider: resolvedProvider,
+    model,
   };
 
   if (parsed.errorMessage) {
