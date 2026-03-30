@@ -80,5 +80,9 @@ tools, persistent memory, session persistence, skills, and MCP support.
 - \`{{taskId}}\` — Current task/issue ID (if assigned)
 - \`{{taskTitle}}\` — Task title (if assigned)
 - \`{{taskBody}}\` — Task description (if assigned)
-- \`{{projectName}}\` — Project name (if scoped to a project)
+| projectName | string | (if scoped to a project) |
 `;
+
+// Re-export createServerAdapter for Paperclip's plugin-loader convention.
+// The plugin-loader imports from the package root, which resolves to this file.
+export { createServerAdapter } from "./server/index.js";

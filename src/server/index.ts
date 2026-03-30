@@ -11,7 +11,14 @@ export {
   resolveHermesDesiredSkillNames as resolveDesiredSkillNames,
 } from "./skills.js";
 
+import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
+import { ADAPTER_TYPE } from "../shared/constants.js";
+import { agentConfigurationDoc, models } from "../index.js";
+import { execute } from "./execute.js";
+import { testEnvironment } from "./test.js";
+import { listHermesSkills as listSkills, syncHermesSkills as syncSkills } from "./skills.js";
+import { detectModel } from "./detect-model.js";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -46,3 +53,27 @@ export const sessionCodec: AdapterSessionCodec = {
     return readNonEmptyString(params.sessionId) ?? readNonEmptyString(params.session_id);
   },
 };
+
+/**
+ * Factory function that assembles the full ServerAdapterModule.
+ * This is the conventional entry point used by Paperclip's plugin-loader
+ * to dynamically load external adapters.
+ *
+ * The detectModel field uses an intersection type because the published
+ * adapter-utils does not yet include it in ServerAdapterModule.
+ */
+export function createServerAdapter(): ServerAdapterModule & {
+  detectModel?: () => Promise<{ model: string; provider: string; source: string; candidates?: string[] } | null>;
+} {
+  return {
+    type: ADAPTER_TYPE,
+    execute,
+    testEnvironment,
+    listSkills,
+    syncSkills,
+    sessionCodec,
+    models,
+    agentConfigurationDoc,
+    detectModel: () => detectModel(),
+  };
+}
