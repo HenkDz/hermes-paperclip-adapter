@@ -44,6 +44,9 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 
+import * as fs from "node:fs/promises";
+import * as nodePath from "node:path";
+
 // ---------------------------------------------------------------------------
 // Config helpers
 // ---------------------------------------------------------------------------
@@ -76,6 +79,12 @@ Your Paperclip identity:
   Company ID: {{companyId}}
   API Base: {{paperclipApiUrl}}
 
+AUTH: Include \`-H "Authorization: Bearer $PAPERCLIP_API_KEY"\` on every curl request to the Paperclip API. This identifies you as this agent (not the board user). GET requests work without it in local mode, but mutating requests (POST/PATCH) need it for correct comment attribution.
+
+Also use \`-H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"\` on mutating requests so the server can link actions to this run.
+
+IMPORTANT: Never pipe curl output into python3 (e.g. \`curl … | python3\`). The command safety scanner blocks pipes to interpreters. Instead save to a temp file then read it: \`curl -s URL -o /tmp/resp.json && python3 -m json.tool /tmp/resp.json\`
+
 {{#taskId}}
 ## Assigned Task
 
@@ -88,18 +97,18 @@ Title: {{taskTitle}}
 
 1. Work on the task using your tools
 2. When done, mark the issue as completed:
-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" -d '{"status":"done"}'\`
 3. Post a completion comment on the issue summarizing what you did:
-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
+   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Content-Type: application/json" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" -d '{"body":"DONE: <your summary here>"}'\`
 4. If this issue has a parent (check the issue body or comments for references like TRA-XX), post a brief notification on the parent issue so the parent owner knows:
-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
+   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Content-Type: application/json" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
 {{/taskId}}
 
 {{#commentId}}
 ## Comment on This Issue
 
 Someone commented. Read it:
-   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
+   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -o /tmp/comment.json && python3 -m json.tool /tmp/comment.json\`
 
 Address the comment, POST a reply if needed, then continue working.
 {{/commentId}}
@@ -108,17 +117,17 @@ Address the comment, POST a reply if needed, then continue working.
 ## Heartbeat Wake — Check for Work
 
 1. List ALL open issues assigned to you (todo, backlog, in_progress):
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -o /tmp/pclip_issues.json && python3 -c "import json;issues=json.load(open('/tmp/pclip_issues.json'));[print(f'{i[\\\"identifier\\\"]} {i[\\\"status\\\"]:>12} {i[\\\"priority\\\"]:>6} {i[\\\"title\\\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
 
 2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
-   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
+   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Authorization: Bearer $PAPERCLIP_API_KEY"\`
    - Do the work in the project directory: {{projectName}}
    - When done, mark complete and post a comment (see Workflow steps 2-4 above)
 
 3. If no issues assigned to you, check for unassigned issues:
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -o /tmp/pclip_unassigned.json && python3 -c "import json;issues=json.load(open('/tmp/pclip_unassigned.json'));[print(f'{i[\\\"identifier\\\"]} {i[\\\"title\\\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
    If you find a relevant issue, assign it to yourself:
-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
+   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
 
 4. If truly nothing to do, report briefly what you checked.
 {{/noTask}}`;
@@ -129,11 +138,14 @@ function buildPrompt(
 ): string {
   const template = cfgString(config.promptTemplate) || DEFAULT_PROMPT_TEMPLATE;
 
-  const taskId = cfgString(ctx.config?.taskId);
-  const taskTitle = cfgString(ctx.config?.taskTitle) || "";
-  const taskBody = cfgString(ctx.config?.taskBody) || "";
-  const commentId = cfgString(ctx.config?.commentId) || "";
-  const wakeReason = cfgString(ctx.config?.wakeReason) || "";
+  // Task metadata comes from the heartbeat context (contextSnapshot),
+  // NOT from adapterConfig. Paperclip populates context with taskId, wakeReason, etc.
+  const context = (ctx.context ?? {}) as Record<string, unknown>;
+  const taskId = cfgString(context?.taskId);
+  const taskTitle = cfgString(context?.taskTitle) || cfgString(context?.issueTitle) || "";
+  const taskBody = cfgString(context?.taskBody) || cfgString(context?.issueDescription) || cfgString(context?.description) || "";
+  const commentId = cfgString(context?.commentId) || "";
+  const wakeReason = cfgString(context?.wakeReason) || "";
   const agentName = ctx.agent?.name || "Hermes Agent";
   const companyName = cfgString(ctx.config?.companyName) || "";
   const projectName = cfgString(ctx.config?.projectName) || "";
@@ -195,8 +207,23 @@ function buildPrompt(
 /** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
 const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
 
-/** Regex for legacy session output format */
-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
+/**
+ * Regex for legacy session output format.
+ *
+ * Hermes session IDs follow the format: YYYYMMDD_HHMMSS_<hash>
+ * e.g. 20260330_221824_311fec
+ *
+ * The previous pattern ([a-zA-Z0-9_-]+) was too greedy and matched
+ * prose like "Use a session ID from a previous CLI run" — capturing
+ * the literal word "from" as a session ID, which poisoned the runtime
+ * state permanently.
+ */
+const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+(\d{8}_\d{6}_[a-f0-9]+)/i;
+
+/** Validate a parsed session ID against Hermes format. Rejects garbage matches. */
+function isValidHermesSessionId(id: string): boolean {
+  return /^\d{8}_\d{6}_[a-f0-9]+$/.test(id);
+}
 
 /** Regex to extract token usage from Hermes output. */
 const TOKEN_USAGE_REGEX =
@@ -219,19 +246,58 @@ interface ParsedOutput {
 
 /** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
 function cleanResponse(raw: string): string {
-  return raw
-    .split("\n")
-    .filter((line) => {
-      const t = line.trim();
-      if (!t) return true; // keep blank lines for paragraph separation
-      if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
-      if (t.startsWith("session_id:")) return false;
-      if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
-      if (/^\[done\]\s*┊/.test(t)) return false;
-      if (/^┊\s*[\p{Emoji_Presentation}]/u.test(t) && !/^┊\s*💬/.test(t)) return false;
-      if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t)) return false;
-      return true;
-    })
+  // Track whether we're inside a tool-call block (┊ 💻, ┊ 📖, etc.)
+  // Continuation lines of multi-line commands don't start with ┊,
+  // so we suppress them by remembering we're still in a tool block.
+  let inToolBlock = false;
+  const lines = raw.split("\n");
+
+  const filtered = lines.filter((line) => {
+    const t = line.trim();
+    if (!t) return true; // keep blank lines for paragraph separation
+    if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
+    if (t.startsWith("session_id:")) return false;
+    if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
+    if (/^\[done\]\s*┊/.test(t)) return false;
+
+    // ┊ + emoji (except ┊ 💬) = tool activity line → start tool block, suppress
+    // Use \p{Emoji} (not Emoji_Presentation) to catch emoji like ✍️ (U+270D+FE0F)
+    // that use variation selectors and don't have Emoji_Presentation on the base char.
+    if (/^┊\s*\p{Emoji}/u.test(t) && !/^┊\s*💬/.test(t)) {
+      inToolBlock = true;
+      return false;
+    }
+
+    // ┊ 💬 = inner thought (stream-of-consciousness) → suppress from summary
+    // The actual assistant response arrives as bare lines later.
+    if (/^┊\s*💬/.test(t)) {
+      inToolBlock = false;
+      return false;
+    }
+
+    // Tool result summary: "Done — output: ..." → suppress, end tool block
+    if (/^Done\s*[—–-]\s*output:/.test(t)) {
+      inToolBlock = false;
+      return false;
+    }
+
+    // Bare duration line ("1.0s") or closing-quote+duration ('"  1.0s')
+    // This signals the end of a tool call body
+    if (/^["']?\s*\d+\.\d+s\s*$/.test(t)) {
+      inToolBlock = false;
+      return false;
+    }
+
+    // Status emoji alone (e.g. ✅, ❌ at start of line)
+    if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t)) return false;
+
+    // Continuation lines inside a tool block (code body from multi-line commands)
+    if (inToolBlock) return false;
+
+    return true;
+  });
+
+  return filtered
     .map((line) => {
       let t = line.replace(/^[\s]*┊\s*💬\s*/, "").trim();
       t = t.replace(/^\[done\]\s*/, "").trim();
@@ -240,6 +306,42 @@ function cleanResponse(raw: string): string {
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+/**
+ * Extract only the final response block from Hermes stdout.
+ *
+ * Hermes outputs the full run (thinking + tool calls + final summary) to stdout.
+ * We only want the last prose block after the last tool activity — the actual
+ * deliverable, not intermediate reasoning.
+ */
+function extractFinalResponseBlock(stdout: string): string {
+  // Split at session_id — everything before it is the response area
+  const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
+  const text = sessionLineIdx > 0 ? stdout.slice(0, sessionLineIdx) : stdout;
+  const lines = text.split("\n");
+
+  // Find the last tool-activity line (┊ + emoji)
+  let lastToolIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (/^┊\s*\p{Emoji}/u.test(t) || /^\[done\]\s*┊/.test(t)) {
+      lastToolIdx = i;
+      break;
+    }
+  }
+
+  if (lastToolIdx >= 0) {
+    // Take everything after the last tool line, skip leading blanks
+    const remaining = lines.slice(lastToolIdx + 1);
+    const firstNonEmpty = remaining.findIndex((l) => l.trim() !== "");
+    if (firstNonEmpty >= 0) {
+      return cleanResponse(remaining.slice(firstNonEmpty).join("\n"));
+    }
+  }
+
+  // No tool lines found — return cleaned full text
+  return cleanResponse(text);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,18 +357,19 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   //
   //   session_id: <id>
   const sessionMatch = stdout.match(SESSION_ID_REGEX);
-  if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch?.[1] ?? null;
-    // The response is everything before the session_id line
-    const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
-    if (sessionLineIdx > 0) {
-      result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
-    }
+  const rawSessionId = sessionMatch?.[1] ?? null;
+
+  if (rawSessionId && isValidHermesSessionId(rawSessionId)) {
+    result.sessionId = rawSessionId;
+    // Extract only the final response block (after last tool activity),
+    // not the full run output with intermediate reasoning.
+    result.response = extractFinalResponseBlock(stdout);
   } else {
     // Legacy format (non-quiet mode)
     const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
-    if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch?.[1] ?? null;
+    const legacyId = legacyMatch?.[1] ?? null;
+    if (legacyId && isValidHermesSessionId(legacyId)) {
+      result.sessionId = legacyId;
     }
     // In non-quiet mode, extract clean response from stdout by
     // filtering out tool lines, system messages, and noise
@@ -354,7 +457,34 @@ export async function execute(
   });
 
   // ── Build prompt ───────────────────────────────────────────────────────
-  const prompt = buildPrompt(ctx, config);
+  // Load agent instructions file if configured (like droid adapter does).
+  // instructionsFilePath is resolved relative to the workspace cwd.
+  const instructionsFilePath = cfgString(config.instructionsFilePath) || "";
+  let instructionsPrefix = "";
+  if (instructionsFilePath) {
+    // Resolve cwd early for instructions path resolution
+    const instrCwd =
+      cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+    const resolvedPath = nodePath.resolve(instrCwd, instructionsFilePath);
+    const instructionsDir = `${nodePath.dirname(resolvedPath)}/`;
+    try {
+      const instructionsContents = await fs.readFile(resolvedPath, "utf8");
+      instructionsPrefix =
+        `${instructionsContents}\n\n` +
+        `The above agent instructions were loaded from ${resolvedPath}. ` +
+        `Resolve any relative file references from ${instructionsDir}.`;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await ctx.onLog(
+        "stdout",
+        `[paperclip] Warning: could not read agent instructions file "${resolvedPath}": ${reason}\n`,
+      );
+    }
+  }
+
+  const prompt = instructionsPrefix
+    ? `${instructionsPrefix}\n\n${buildPrompt(ctx, config)}`
+    : buildPrompt(ctx, config);
 
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
@@ -410,12 +540,23 @@ export async function execute(
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
-  const taskId = cfgString(ctx.config?.taskId);
+  const taskId = cfgString((ctx.context as Record<string, unknown>)?.taskId);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
+  // Inject the agent JWT so curl commands can authenticate as this agent.
+  // Without this, the Paperclip auth middleware falls back to "local_implicit"
+  // board user, and all issue comments appear attributed to "You" instead of
+  // the agent.  The Claude/Codex adapters follow the same pattern.
   const userEnv = config.env as Record<string, string> | undefined;
-  if (userEnv && typeof userEnv === "object") {
-    Object.assign(env, userEnv);
+  const hasExplicitApiKey =
+    typeof userEnv?.PAPERCLIP_API_KEY === "string" && userEnv.PAPERCLIP_API_KEY.trim().length > 0;
+  if (!hasExplicitApiKey && ctx.authToken) {
+    env.PAPERCLIP_API_KEY = ctx.authToken;
+  }
+
+  const userEnvFinal = userEnv;
+  if (userEnvFinal && typeof userEnvFinal === "object") {
+    Object.assign(env, userEnvFinal);
   }
 
   // ── Resolve working directory ──────────────────────────────────────────
@@ -519,7 +660,7 @@ export async function execute(
   // Store session ID for next run
   if (persistSession && parsed.sessionId) {
     executionResult.sessionParams = { sessionId: parsed.sessionId };
-    executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+    executionResult.sessionDisplayId = parsed.sessionId;
   }
 
   return executionResult;
