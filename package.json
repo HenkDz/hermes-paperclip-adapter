@@ -1,10 +1,13 @@
 {
-  "name": "hermes-paperclip-adapter",
-  "version": "0.2.1",
+  "name": "@henkey/hermes-paperclip-adapter",
+  "version": "0.3.1",
   "description": "Paperclip adapter for Hermes Agent — run Hermes as a managed employee in a Paperclip company",
   "type": "module",
   "license": "MIT",
   "author": "Nous Research",
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/NousResearch/hermes-paperclip-adapter"
@@ -21,6 +24,7 @@
     ".": "./dist/index.js",
     "./server": "./dist/server/index.js",
     "./ui": "./dist/ui/index.js",
+    "./ui-parser": "./dist/ui-parser.js",
     "./cli": "./dist/cli/index.js"
   },
   "files": [

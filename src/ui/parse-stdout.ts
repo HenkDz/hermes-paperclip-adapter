@@ -2,13 +2,24 @@
  * Parse Hermes Agent stdout into TranscriptEntry objects for the Paperclip UI.
  *
  * Hermes CLI quiet-mode output patterns:
- *   Assistant:  "  ┊ 💬 {text}"
- *   Tool (TTY): "  ┊ {emoji} {verb:9} {detail}  {duration}"
- *   Tool (pipe): "  [done] ┊ {emoji} {verb:9} {detail}  {duration} ({total})"
- *   System:     "[hermes] ..."
+ *   Inner thought: "  ┊ 💬 {text}"              → thinking (stream-of-consciousness)
+ *   Tool (TTY):    "  ┊ {emoji} {verb:9} {detail}  {duration}"
+ *   Tool (pipe):   "  [done] ┊ {emoji} {verb:9} {detail}  {duration} ({total})"
+ *   System:        "[hermes] ..."
+ *   Assistant:     bare lines after activity    → the final "out loud" response
  *
  * We emit structured tool_call/tool_result pairs so Paperclip renders proper
  * tool cards (with status icons, expand/collapse) instead of raw stdout blocks.
+ *
+ * Output structure:
+ *   All ┊ lines are internal activity (tool calls, inner thoughts).
+ *   Bare lines (no ┊ prefix) that appear after tool activity or a blank line
+ *   are the actual assistant response — these must NOT be suppressed.
+ *
+ * Multi-line commands: Hermes splits multi-line tool output across separate
+ * stdout chunks (separated by \r\n). The first line has the ┊ prefix, but
+ * continuation lines (the actual command body) do not. We suppress these
+ * ONLY immediately after a tool_result, until a blank line resets the state.
  */
 
 import type { TranscriptEntry } from "@paperclipai/adapter-utils";
@@ -156,6 +167,20 @@ function syntheticToolUseId(): string {
   return `hermes-tool-${++toolCallCounter}`;
 }
 
+// ── Multi-line command continuation tracking ───────────────────────────────
+
+/**
+ * Track multi-line command continuation state.
+ *
+ * After a tool_result is emitted, the NEXT line(s) may be continuation
+ * noise from the command body (split across \r\n chunks). These are
+ * immediately after the tool line with no blank separator.
+ *
+ * A blank line resets this state — it signals the end of tool activity
+ * and the start of the actual assistant response (bare lines).
+ */
+let suppressContinuation = false;
+
 // ── Thinking detection ─────────────────────────────────────────────────────
 
 function isThinkingLine(line: string): boolean {
@@ -184,10 +209,19 @@ export function parseHermesStdoutLine(
   ts: string,
 ): TranscriptEntry[] {
   const trimmed = line.trim();
-  if (!trimmed) return [];
+
+  // ── Blank line → resets continuation suppression ─────────────────────
+  // Blank lines signal the boundary between tool activity and the
+  // assistant's actual response. After a blank line, bare lines
+  // are real output, not command continuation noise.
+  if (!trimmed) {
+    suppressContinuation = false;
+    return [];
+  }
 
   // ── System/adapter messages ────────────────────────────────────────────
   if (trimmed.startsWith("[hermes]") || trimmed.startsWith("[paperclip]")) {
+    suppressContinuation = false;
     return [{ kind: "system", ts, text: trimmed }];
   }
 
@@ -202,6 +236,7 @@ export function parseHermesStdoutLine(
   // Pattern: [2026-03-25T10:40:53.941Z] INFO: ...
   // Emit as stderr so Paperclip groups them into the amber accordion.
   if (/^\[\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
+    suppressContinuation = false;
     return [{ kind: "stderr", ts, text: trimmed }];
   }
 
@@ -213,14 +248,18 @@ export function parseHermesStdoutLine(
 
   // ── Session info line ────────────────────────────────────────────────
   if (trimmed.startsWith("session_id:")) {
+    suppressContinuation = false;
     return [{ kind: "system", ts, text: trimmed }];
   }
 
   // ── Quiet-mode tool/message lines (prefixed with ┊) ────────────────────
   if (trimmed.includes(TOOL_OUTPUT_PREFIX)) {
-    // Assistant message: ┊ 💬 {text}
+    // Inner thought: ┊ 💬 {text} → thinking, not assistant output
+    // These are the model's stream-of-consciousness while working.
+    // The actual "out loud" response arrives as bare lines later.
     if (isAssistantToolLine(trimmed)) {
-      return [{ kind: "assistant", ts, text: extractAssistantText(trimmed) }];
+      suppressContinuation = false;
+      return [{ kind: "thinking", ts, text: extractAssistantText(trimmed) }];
     }
 
     // Tool completion: ┊ {emoji} {verb} {detail} {duration}
@@ -230,6 +269,9 @@ export function parseHermesStdoutLine(
       const detailText = toolInfo.duration
         ? `${toolInfo.detail}  ${toolInfo.duration}`
         : toolInfo.detail;
+
+      // Track this tool result for potential continuation lines
+      suppressContinuation = true;
 
       return [
         {
@@ -254,7 +296,67 @@ export function parseHermesStdoutLine(
       .replace(/^\[done\]\s*/, "")
       .replace(new RegExp(`^${TOOL_OUTPUT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`), "")
       .trim();
+    suppressContinuation = false;
     return [{ kind: "stdout", ts, text: stripped }];
+  }
+
+  // ── Multi-line command continuation (noise) ─────────────────────────────
+  // After a tool_result, bare lines are continuation noise from multi-line
+  // command bodies split across \r\n chunks. Keep suppressing until a
+  // blank line resets the state.
+  //
+  // We detect end-of-continuation by:
+  //   1. Blank line → definite boundary
+  //   2. Bare duration "1.0s" or closing-quote+duration → end of tool cmd
+  //   3. Lines that look like prose (start with capital letter, no leading
+  //      indentation, no code syntax) → likely real assistant output
+  if (suppressContinuation) {
+    // Blank line → end of tool block
+    if (!trimmed) {
+      suppressContinuation = false;
+      return [];
+    }
+    // Duration-only line (trailing timing from tool command)
+    if (/^\s*\d+\.\d+s\s*$/.test(trimmed)) {
+      suppressContinuation = false;
+      return [];
+    }
+    // Closing quote + duration: '"  1.0s or "' 1.0s
+    if (/^["']\s*\d+\.\d+s\s*$/.test(trimmed)) {
+      suppressContinuation = false;
+      return [];
+    }
+    // Lines starting with ┊ are new tool/message activity, not continuation
+    if (trimmed.startsWith(TOOL_OUTPUT_PREFIX)) {
+      suppressContinuation = false;
+      // Don't return here — let the ┊ handler above process it on next call
+      // Actually we can't re-enter, so fall through after resetting
+      return [{ kind: "assistant", ts, text: trimmed }];
+    }
+    // Heuristic: if the line looks like prose (not code), stop suppressing.
+    // Code continuation lines typically have: leading whitespace, Python/JS syntax,
+    // JSON, operators, closing brackets. Prose starts with a capital letter
+    // or common sentence starters and has no code-like patterns.
+    const looksLikeProse = /^[A-Z"*\-#\d(]/.test(trimmed) &&
+      !/[{}()\[\];:=]/.test(trimmed.slice(0, 20)) &&
+      !trimmed.startsWith("import ") &&
+      !trimmed.startsWith("from ") &&
+      !trimmed.startsWith("const ") &&
+      !trimmed.startsWith("let ") &&
+      !trimmed.startsWith("var ") &&
+      !trimmed.startsWith("if ") &&
+      !trimmed.startsWith("for ") &&
+      !trimmed.startsWith("while ") &&
+      !trimmed.startsWith("def ") &&
+      !trimmed.startsWith("class ") &&
+      !trimmed.startsWith("return ") &&
+      !trimmed.startsWith("print(");
+    if (looksLikeProse) {
+      suppressContinuation = false;
+      return [{ kind: "assistant", ts, text: trimmed }];
+    }
+    // Still looks like continuation code — suppress and keep tracking
+    return [];
   }
 
   // ── Thinking blocks ────────────────────────────────────────────────────
@@ -277,6 +379,8 @@ export function parseHermesStdoutLine(
     return [{ kind: "stderr", ts, text: trimmed }];
   }
 
-  // ── Regular assistant output ───────────────────────────────────────────
+  // ── Bare line = actual assistant output ────────────────────────────────
+  // In quiet mode, all ┊ lines are internal activity (tools, inner thoughts).
+  // Bare lines are the assistant's final "out loud" response.
   return [{ kind: "assistant", ts, text: trimmed }];
 }
