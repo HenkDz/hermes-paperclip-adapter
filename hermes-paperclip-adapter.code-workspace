@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../paperclip-fork"
+		}
+	],
+	"settings": {
+		"powershell.cwd": "paperclip-fork"
+	}
+}

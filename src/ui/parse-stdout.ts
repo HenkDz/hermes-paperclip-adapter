@@ -333,11 +333,20 @@ export function parseHermesStdoutLine(
       // Actually we can't re-enter, so fall through after resetting
       return [{ kind: "assistant", ts, text: trimmed }];
     }
+    // Duration at end of a continuation line: '-d '{"status":"done"}'  1.0s'
+    if (/\d+\.\d+s\s*$/.test(trimmed) && /^(["']?\s*[-\\])/.test(trimmed)) {
+      suppressContinuation = false;
+      return [];
+    }
+    // Shell/curl continuation flags — NEVER prose
+    if (/^[-\\]/.test(trimmed)) {
+      return [];
+    }
     // Heuristic: if the line looks like prose (not code), stop suppressing.
     // Code continuation lines typically have: leading whitespace, Python/JS syntax,
     // JSON, operators, closing brackets. Prose starts with a capital letter
     // or common sentence starters and has no code-like patterns.
-    const looksLikeProse = /^[A-Z"*\-#\d(]/.test(trimmed) &&
+    const looksLikeProse = /^[A-Z"*#\d(]/.test(trimmed) &&
       !/[{}()\[\];:=]/.test(trimmed.slice(0, 20)) &&
       !trimmed.startsWith("import ") &&
       !trimmed.startsWith("from ") &&

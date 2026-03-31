@@ -234,6 +234,7 @@ export function createStdoutParser(): StdoutParser {
         suppressContinuation = false;
         return [];
       }
+      // Bare duration line: "1.2s" or "'  1.2s" — end of tool body
       if (/^\s*\d+\.\d+s\s*$/.test(trimmed)) {
         suppressContinuation = false;
         return [];
@@ -242,16 +243,25 @@ export function createStdoutParser(): StdoutParser {
         suppressContinuation = false;
         return [];
       }
+      // Duration at end of a continuation line: '...json}'  1.2s
+      if (/\d+\.\d+s\s*$/.test(trimmed) && /^(["']?\s*[-\\])/.test(trimmed)) {
+        suppressContinuation = false;
+        return [];
+      }
       if (trimmed.startsWith(TOOL_OUTPUT_PREFIX)) {
         suppressContinuation = false;
         return [{ kind: "assistant", ts, text: trimmed }];
+      }
+      // Shell/curl continuation flags — NEVER prose
+      if (/^[-\\]/.test(trimmed)) {
+        return [];
       }
       const codeKeywords = [
         "import ", "from ", "const ", "let ", "var ", "if ", "for ",
         "while ", "def ", "class ", "return ", "print(",
       ];
       const looksLikeProse =
-        /^[A-Z"*\-#\d(]/.test(trimmed) &&
+        /^[A-Z\"*#\d(]/.test(trimmed) &&
         !/[{}()\[\];:=]/.test(trimmed.slice(0, 20)) &&
         !codeKeywords.some((kw) => trimmed.startsWith(kw));
       if (looksLikeProse) {
