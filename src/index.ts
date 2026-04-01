@@ -40,28 +40,49 @@ tools, persistent memory, session persistence, skills, and MCP support.
 - Hermes Agent installed: \`pip install hermes-agent\`
 - At least one LLM API key configured in ~/.hermes/.env
 
+## Profile (Hermes-specific)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| profile | string | (default) | Hermes profile name for isolated agent identity. Creates an isolated instance with its own config, API keys, memory, sessions, and skills. Auto-created from active profile on first run if it doesn't exist. |
+
+Profiles give each Paperclip agent a fully isolated Hermes instance:
+- Separate API keys and model preferences
+- Separate SOUL.md (personality, domain expertise)
+- Separate memory and sessions (no cross-contamination)
+- Separate skills and MCP server connections
+- Separate cron jobs
+
+Leave blank to use the default profile.
+
 ## Core Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | model | string | (Hermes configured default) | Optional explicit model in provider/model format. Leave blank to use Hermes's configured default model. |
 | provider | string | (auto) | API provider: auto, openrouter, nous, openai-codex, zai, kimi-coding, minimax, minimax-cn. Usually not needed — Hermes auto-detects from model name. |
+| reasoningEffort | string | medium | Reasoning effort level: low, medium, high. Silently ignored by models that don't support it. Higher = more thorough but slower and more expensive. |
 | timeoutSec | number | 300 | Execution timeout in seconds |
 | graceSec | number | 10 | Grace period after SIGTERM before SIGKILL |
+
+## Delivery
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| deliveryTarget | string | none | Where to send run results. Options: none, telegram, discord, slack, whatsapp, signal. Requires Hermes gateway to be running and configured for the target platform. |
+
+## Memory & Session
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| memoryScope | string | session | Memory persistence: "session" (resume across heartbeats), "persistent" (full isolation via profile with own memories dir), "ephemeral" (fresh start every run). |
+| persistSession | boolean | true | (Deprecated — use memoryScope instead) Resume sessions across heartbeats. |
 
 ## Tool Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | toolsets | string | (all) | Comma-separated toolsets to enable (e.g. "terminal,file,web") |
-
-## Session & Workspace
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| persistSession | boolean | true | Resume sessions across heartbeats |
-| worktreeMode | boolean | false | Use git worktree for isolated changes |
-| checkpoints | boolean | false | Enable filesystem checkpoints |
 
 ## Advanced
 

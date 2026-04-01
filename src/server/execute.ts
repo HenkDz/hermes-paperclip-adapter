@@ -36,13 +36,24 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
+  DEFAULT_REASONING_EFFORT,
+  DEFAULT_DELIVERY_TARGET,
+  DEFAULT_MEMORY_SCOPE,
   VALID_PROVIDERS,
+  VALID_REASONING_EFFORTS,
+  VALID_DELIVERY_TARGETS,
+  VALID_MEMORY_SCOPES,
 } from "../shared/constants.js";
 
 import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
+
+import {
+  ensureProfile,
+  resolveProfilePath,
+} from "./profiles.js";
 
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
@@ -424,9 +435,18 @@ export async function execute(
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
-  const persistSession = cfgBoolean(config.persistSession) !== false;
-  const worktreeMode = cfgBoolean(config.worktreeMode) === true;
-  const checkpoints = cfgBoolean(config.checkpoints) === true;
+
+  // Profile support
+  const profileName = cfgString(config.profile);
+
+  // Reasoning effort (optional — silently ignored by models that don't support it)
+  const reasoningEffort = cfgString(config.reasoningEffort) || DEFAULT_REASONING_EFFORT;
+
+  // Delivery target (where to send run results)
+  const deliveryTarget = cfgString(config.deliveryTarget) || DEFAULT_DELIVERY_TARGET;
+
+  // Memory scope controls session resume behavior
+  const memoryScope = cfgString(config.memoryScope) || DEFAULT_MEMORY_SCOPE;
 
   // ── Resolve provider (defense in depth) ────────────────────────────────
   // Priority chain:
@@ -443,7 +463,7 @@ export async function execute(
 
   if (!explicitProvider) {
     try {
-      detectedConfig = await detectModel();
+      detectedConfig = await detectModel(undefined, profileName);
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }
@@ -492,6 +512,33 @@ export async function execute(
   const args: string[] = ["chat", "-q", prompt];
   if (useQuiet) args.push("-Q");
 
+  // ── Build environment (before args, needed for profile HERMES_HOME) ───
+  const env: Record<string, string> = {
+    ...(process.env as Record<string, string>),
+    ...buildPaperclipEnv(ctx.agent),
+  };
+
+  // Profile: -p is a global flag (must come before subcommand would,
+  // but hermes chat also accepts it as a passthrough via extra position).
+  // Actually -p is a top-level flag, so we use: hermes -p <name> chat -q ...
+  // We handle this by setting HERMES_HOME instead, which is more reliable.
+  if (profileName && profileName !== "default") {
+    // Ensure profile exists (auto-create with --clone if missing)
+    const profilePath = await ensureProfile(profileName);
+    if (profilePath) {
+      env.HERMES_HOME = profilePath;
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Using profile: ${profileName} (${profilePath})\n`,
+      );
+    } else {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Warning: profile "${profileName}" could not be created, falling back to default\n`,
+      );
+    }
+  }
+
   if (model) {
     args.push("-m", model);
   }
@@ -502,12 +549,18 @@ export async function execute(
     args.push("--provider", resolvedProvider);
   }
 
+  // Reasoning effort — silently ignored by models that don't support it
+  if (reasoningEffort && (VALID_REASONING_EFFORTS as readonly string[]).includes(reasoningEffort)) {
+    args.push("--reasoning-effort", reasoningEffort);
+  }
+
   if (toolsets) {
     args.push("-t", toolsets);
   }
 
-  if (worktreeMode) args.push("-w");
-  if (checkpoints) args.push("--checkpoints");
+  // Worktree mode (backward compat)
+  if (cfgBoolean(config.worktreeMode) === true) args.push("-w");
+  if (cfgBoolean(config.checkpoints) === true) args.push("--checkpoints");
   if (cfgBoolean(config.verbose) === true) args.push("-v");
 
   // Tag sessions as "tool" source so they don't clutter the user's session history.
@@ -521,10 +574,11 @@ export async function execute(
   // system is designed for human-attended interactive sessions.
   args.push("--yolo");
 
-  // Session resume
+  // Session resume — controlled by memoryScope
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
+  const persistSession = memoryScope !== "ephemeral";
   if (persistSession && prevSessionId) {
     args.push("--resume", prevSessionId);
   }
@@ -533,12 +587,7 @@ export async function execute(
     args.push(...extraArgs);
   }
 
-  // ── Build environment ──────────────────────────────────────────────────
-  const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    ...buildPaperclipEnv(ctx.agent),
-  };
-
+  // ── Inject agent identity and delivery target ────────────────────────
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
   const taskId = cfgString((ctx.context as Record<string, unknown>)?.taskId);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
@@ -548,10 +597,14 @@ export async function execute(
   // board user, and all issue comments appear attributed to "You" instead of
   // the agent.  The Claude/Codex adapters follow the same pattern.
   const userEnv = config.env as Record<string, string> | undefined;
-  const hasExplicitApiKey =
-    typeof userEnv?.PAPERCLIP_API_KEY === "string" && userEnv.PAPERCLIP_API_KEY.trim().length > 0;
+  const hasExplicitApiKey = typeof userEnv?.PAPERCLIP_API_KEY === "string" && userEnv.PAPERCLIP_API_KEY.trim().length > 0;
   if (!hasExplicitApiKey && ctx.authToken) {
     env.PAPERCLIP_API_KEY = ctx.authToken;
+  }
+
+  // Delivery target: tell Hermes where to send run results
+  if (deliveryTarget && deliveryTarget !== "none" && (VALID_DELIVERY_TARGETS as readonly string[]).includes(deliveryTarget)) {
+    env.HERMES_DELIVERY_TARGET = deliveryTarget;
   }
 
   const userEnvFinal = userEnv;
@@ -571,7 +624,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s)\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], effort=${reasoningEffort}, memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, timeout=${timeoutSec}s)\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(
@@ -657,7 +710,7 @@ export async function execute(
     cost_usd: parsed.costUsd ?? null,
   };
 
-  // Store session ID for next run
+  // Store session ID for next run (respect memory scope)
   if (persistSession && parsed.sessionId) {
     executionResult.sessionParams = { sessionId: parsed.sessionId };
     executionResult.sessionDisplayId = parsed.sessionId;

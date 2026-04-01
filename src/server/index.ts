@@ -10,6 +10,12 @@ export {
   syncHermesSkills as syncSkills,
   resolveHermesDesiredSkillNames as resolveDesiredSkillNames,
 } from "./skills.js";
+export {
+  listProfiles,
+  resolveProfilePath,
+  ensureProfile,
+  getProfileConfigContent,
+} from "./profiles.js";
 
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";

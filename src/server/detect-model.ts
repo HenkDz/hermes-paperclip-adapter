@@ -28,12 +28,32 @@ export interface DetectedModel {
 
 /**
  * Read the Hermes config file and extract the default model config.
+ *
+ * When `profileName` is provided, reads from the profile's config.yaml
+ * (falling back to HERMES_HOME/config.yaml if the profile has no override).
+ * When omitted, reads from HERMES_HOME/config.yaml (the default profile).
  */
 export async function detectModel(
   configPath?: string,
+  profileName?: string,
 ): Promise<DetectedModel | null> {
-  const filePath = configPath ?? join(homedir(), ".hermes", "config.yaml");
+  // If an explicit config path is given, use it directly
+  if (configPath) {
+    const content = await readFile(configPath, "utf-8").catch(() => null);
+    return content ? parseModelFromConfig(content) : null;
+  }
 
+  // Profile-aware detection: try profile config first, then default
+  if (profileName && profileName !== "default") {
+    const profileConfigPath = join(homedir(), ".hermes", "profiles", profileName, "config.yaml");
+    const profileContent = await readFile(profileConfigPath, "utf-8").catch(() => null);
+    if (profileContent) {
+      return parseModelFromConfig(profileContent);
+    }
+  }
+
+  // Default: read from HERMES_HOME/config.yaml
+  const filePath = configPath ?? join(homedir(), ".hermes", "config.yaml");
   let content: string;
   try {
     content = await readFile(filePath, "utf-8");

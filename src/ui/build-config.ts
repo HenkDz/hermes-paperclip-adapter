@@ -14,6 +14,9 @@ import type { CreateConfigValues } from "@paperclipai/adapter-utils";
 
 import {
   DEFAULT_TIMEOUT_SEC,
+  DEFAULT_REASONING_EFFORT,
+  DEFAULT_DELIVERY_TARGET,
+  DEFAULT_MEMORY_SCOPE,
 } from "../shared/constants.js";
 
 /**
@@ -34,7 +37,7 @@ export function buildHermesConfig(
   // Instead, provider is resolved at runtime in execute.ts using
   // a priority chain:
   //   1. adapterConfig.provider (if set via API directly)
-  //   2. ~/.hermes/config.yaml detection
+  //   2. ~/.hermes/config.yaml detection (profile-aware)
   //   3. Model-name prefix inference
   //   4. "auto" fallback
   // This ensures correct provider routing even for agents created
@@ -42,9 +45,17 @@ export function buildHermesConfig(
 
   // Execution limits
   ac.timeoutSec = DEFAULT_TIMEOUT_SEC;
-  // maxTurnsPerRun maps to Hermes's max_turns (set via config, not CLI flag)
 
-  // Session persistence (default: on)
+  // Reasoning effort
+  ac.reasoningEffort = DEFAULT_REASONING_EFFORT;
+
+  // Delivery target
+  ac.deliveryTarget = DEFAULT_DELIVERY_TARGET;
+
+  // Memory scope
+  ac.memoryScope = DEFAULT_MEMORY_SCOPE;
+
+  // Session persistence (backward compat — memoryScope takes precedence)
   ac.persistSession = true;
 
   // Working directory
@@ -62,11 +73,9 @@ export function buildHermesConfig(
     ac.extraArgs = v.extraArgs.split(/\s+/).filter(Boolean);
   }
 
-  // Thinking/reasoning effort
+  // Thinking/reasoning effort from Paperclip UI (maps to our reasoningEffort)
   if (v.thinkingEffort) {
-    const existing = (ac.extraArgs as string[]) || [];
-    existing.push("--reasoning-effort", String(v.thinkingEffort));
-    ac.extraArgs = existing;
+    ac.reasoningEffort = String(v.thinkingEffort);
   }
 
   // Prompt template
