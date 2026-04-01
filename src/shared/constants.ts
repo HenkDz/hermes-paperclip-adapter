@@ -147,3 +147,160 @@ export type MemoryScope = (typeof VALID_MEMORY_SCOPES)[number];
 
 /** Default memory scope. */
 export const DEFAULT_MEMORY_SCOPE: MemoryScope = "session";
+
+// ── Provider & Model catalog ─────────────────────────────────────────────
+
+/**
+ * Human-readable provider labels for the config UI.
+ * Keys must match VALID_PROVIDERS entries.
+ */
+export const PROVIDER_LABELS: Record<string, string> = {
+  auto: "Auto (from profile config)",
+  openrouter: "OpenRouter",
+  nous: "Nous Portal",
+  openai_codex: "OpenAI Codex",
+  copilot: "GitHub Copilot",
+  "copilot-acp": "GitHub Copilot ACP",
+  anthropic: "Anthropic",
+  huggingface: "Hugging Face",
+  zai: "Z.AI / GLM",
+  kimi_coding: "Kimi / Moonshot",
+  minimax: "MiniMax",
+  minimax_cn: "MiniMax (China)",
+  kilocode: "Kilo Code",
+  alibaba: "Alibaba Cloud",
+  opencode_zen: "OpenCode Zen",
+  opencode_go: "OpenCode Go",
+  ai_gateway: "AI Gateway",
+  deepseek: "DeepSeek",
+  custom: "Custom endpoint",
+};
+
+/**
+ * Static model catalog per provider.
+ * Used for the combobox dropdown when a provider is selected.
+ * Models can also be typed freely (custom values).
+ */
+export const PROVIDER_MODELS: Record<string, string[]> = {
+  openrouter: [
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-sonnet-4.5",
+    "anthropic/claude-haiku-4.5",
+    "openai/gpt-5.4",
+    "openai/gpt-5.4-mini",
+    "openai/gpt-5.4-pro",
+    "openai/gpt-5.4-nano",
+    "openai/gpt-5.3-codex",
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview",
+    "google/gemini-3.1-pro-preview",
+    "google/gemini-3.1-flash-lite-preview",
+    "qwen/qwen3.5-plus-02-15",
+    "qwen/qwen3.5-35b-a3b",
+    "z-ai/glm-5",
+    "z-ai/glm-5-turbo",
+    "moonshotai/kimi-k2.5",
+    "minimax/minimax-m2.7",
+    "minimax/minimax-m2.5",
+    "x-ai/grok-4.20-beta",
+    "deepseek/deepseek-v3.2",
+    "nvidia/nemotron-3-super-120b-a12b",
+  ],
+  nous: [
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6",
+    "anthropic/claude-sonnet-4.5",
+    "openai/gpt-5.4",
+    "openai/gpt-5.3-codex",
+    "google/gemini-3-pro-preview",
+    "z-ai/glm-5",
+    "z-ai/glm-5-turbo",
+    "moonshotai/kimi-k2.5",
+  ],
+  "openai-codex": [
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+  ],
+  copilot: [
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5-mini",
+    "gpt-5.3-codex",
+    "gpt-4.1",
+    "gpt-4o",
+    "claude-opus-4.6",
+    "claude-sonnet-4.6",
+    "claude-sonnet-4.5",
+    "claude-haiku-4.5",
+  ],
+  "copilot-acp": ["copilot-acp"],
+  zai: ["glm-5", "glm-5-turbo", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
+  "kimi-coding": [
+    "kimi-for-coding",
+    "kimi-k2.5",
+    "kimi-k2-thinking",
+    "kimi-k2-thinking-turbo",
+    "kimi-k2-turbo-preview",
+  ],
+  minimax: ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.1"],
+  "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.1"],
+  anthropic: [
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5-20250929",
+    "claude-opus-4-20250514",
+    "claude-sonnet-4-20250514",
+    "claude-haiku-4-5-20251001",
+  ],
+  deepseek: ["deepseek-chat", "deepseek-reasoner"],
+  kilocode: [
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5.4",
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash-preview",
+  ],
+  alibaba: [
+    "qwen3.5-plus",
+    "qwen3-coder-plus",
+    "qwen3-coder-next",
+    "glm-5",
+    "glm-4.7",
+    "kimi-k2.5",
+    "MiniMax-M2.5",
+  ],
+  huggingface: [
+    "Qwen/Qwen3.5-397B-A17B",
+    "Qwen/Qwen3.5-35B-A3B",
+    "deepseek-ai/DeepSeek-V3.2",
+    "moonshotai/Kimi-K2.5",
+    "MiniMaxAI/MiniMax-M2.5",
+    "zai-org/GLM-5",
+    "moonshotai/Kimi-K2-Thinking",
+  ],
+  "opencode-zen": [
+    "gpt-5.4-pro",
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "gemini-3.1-pro",
+    "minimax-m2.7",
+    "glm-5",
+    "kimi-k2.5",
+  ],
+  "opencode-go": ["glm-5", "kimi-k2.5", "minimax-m2.7"],
+  "ai-gateway": [
+    "anthropic/claude-opus-4.6",
+    "anthropic/claude-sonnet-4.6",
+    "openai/gpt-5",
+    "google/gemini-3-pro-preview",
+    "google/gemini-3-flash",
+    "deepseek/deepseek-v3.2",
+  ],
+};
+

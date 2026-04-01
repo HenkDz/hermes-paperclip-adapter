@@ -21,6 +21,7 @@
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
+  AdapterInvocationMeta,
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 
@@ -36,11 +37,9 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
-  DEFAULT_REASONING_EFFORT,
   DEFAULT_DELIVERY_TARGET,
   DEFAULT_MEMORY_SCOPE,
   VALID_PROVIDERS,
-  VALID_REASONING_EFFORTS,
   VALID_DELIVERY_TARGETS,
   VALID_MEMORY_SCOPES,
 } from "../shared/constants.js";
@@ -430,7 +429,6 @@ export async function execute(
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
-  const model = cfgString(config.model) || DEFAULT_MODEL;
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
@@ -438,36 +436,34 @@ export async function execute(
 
   // Profile support
   const profileName = cfgString(config.profile);
-
-  // Reasoning effort (optional — silently ignored by models that don't support it)
-  const reasoningEffort = cfgString(config.reasoningEffort) || DEFAULT_REASONING_EFFORT;
-
   // Delivery target (where to send run results)
   const deliveryTarget = cfgString(config.deliveryTarget) || DEFAULT_DELIVERY_TARGET;
 
   // Memory scope controls session resume behavior
   const memoryScope = cfgString(config.memoryScope) || DEFAULT_MEMORY_SCOPE;
 
-  // ── Resolve provider (defense in depth) ────────────────────────────────
+  // ── Resolve model + provider (defense in depth) ────────────────────────
   // Priority chain:
-  //   1. Explicit provider in adapterConfig (user override)
-  //   2. Provider from ~/.hermes/config.yaml (detected at runtime)
+  //   1. Explicit model/provider in adapterConfig (user override)
+  //   2. Model/provider from profile's config.yaml or default Hermes config
   //   3. Provider inferred from model name prefix
-  //   4. "auto" (let Hermes decide)
-  //
-  // This ensures that even if the agent was created before provider tracking
-  // was added, or if the model was changed without updating provider, the
-  // correct provider is still used.
+  //   4. "auto" (let Hermes decide) / DEFAULT_MODEL as last resort
   let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   const explicitProvider = cfgString(config.provider);
+  const explicitModel = cfgString(config.model);
 
-  if (!explicitProvider) {
+  // Detect model/provider from profile or default Hermes config.
+  // This is used both for resolving the model fallback and for provider detection.
+  if (!explicitProvider || !explicitModel) {
     try {
       detectedConfig = await detectModel(undefined, profileName);
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }
   }
+
+  // Resolve model: explicit config > profile config > hardcoded default
+  const model = explicitModel || detectedConfig?.model || DEFAULT_MODEL;
 
   const { provider: resolvedProvider, resolvedFrom } = resolveProvider({
     explicitProvider,
@@ -539,19 +535,20 @@ export async function execute(
     }
   }
 
-  if (model) {
+  // When a profile is set and no explicit model/provider is in adapterConfig,
+  // let Hermes use its own config.yaml (which we already detected from).
+  // Only pass --model / --provider when explicitly configured in Paperclip
+  // to avoid overriding the profile's settings with wrong credentials.
+  const useProfileConfig = profileName && profileName !== "default" && !explicitModel && !explicitProvider;
+
+  if (!useProfileConfig && model) {
     args.push("-m", model);
   }
 
-  // Always pass --provider when we have a resolved one (not "auto").
+  // Only pass --provider when explicitly configured or when not using profile config.
   // "auto" means Hermes will decide on its own — no need to pass it.
-  if (resolvedProvider !== "auto") {
+  if (!useProfileConfig && resolvedProvider !== "auto") {
     args.push("--provider", resolvedProvider);
-  }
-
-  // Reasoning effort — silently ignored by models that don't support it
-  if (reasoningEffort && (VALID_REASONING_EFFORTS as readonly string[]).includes(reasoningEffort)) {
-    args.push("--reasoning-effort", reasoningEffort);
   }
 
   if (toolsets) {
@@ -621,10 +618,33 @@ export async function execute(
     // Non-fatal
   }
 
+  // ── Report invocation metadata to Paperclip ───────────────────────────
+  // This populates the RunInvocationCard in the UI.
+  const commandNotes: string[] = [];
+  if (model) commandNotes.push(`Model: ${model} (provider: ${resolvedProvider} [${resolvedFrom}])`);
+  if (profileName && profileName !== "default") commandNotes.push(`Profile: ${profileName}`);
+  if (toolsets) commandNotes.push(`Toolsets: ${toolsets}`);
+  commandNotes.push(`Memory: ${memoryScope}${deliveryTarget !== "none" ? ` → ${deliveryTarget}` : ""}`);
+  if (instructionsFilePath) commandNotes.push(`Instructions: ${instructionsFilePath}`);
+  if (prevSessionId) commandNotes.push(`Resuming session: ${prevSessionId}`);
+
+  if (ctx.onMeta) {
+    await ctx.onMeta({
+      adapterType: "hermes_local",
+      command: hermesCmd,
+      cwd,
+      commandArgs: args,
+      commandNotes,
+      env,
+      prompt,
+      context: ctx.context as Record<string, unknown> | undefined,
+    });
+  }
+
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], effort=${reasoningEffort}, memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, timeout=${timeoutSec}s)\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, timeout=${timeoutSec}s)\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(

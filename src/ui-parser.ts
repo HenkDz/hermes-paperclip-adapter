@@ -141,7 +141,7 @@ function isThinkingLine(line: string): boolean {
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export interface TranscriptEntry {
-  kind: "system" | "stderr" | "thinking" | "tool_call" | "tool_result" | "assistant" | "stdout";
+  kind: "system" | "stderr" | "thinking" | "tool_call" | "tool_result" | "assistant" | "stdout" | "diff";
   ts: string;
   text?: string;
   name?: string;
@@ -150,6 +150,7 @@ export interface TranscriptEntry {
   content?: string;
   isError?: boolean;
   delta?: boolean;
+  changeType?: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation";
 }
 
 export interface StdoutParser {
@@ -168,6 +169,32 @@ export interface StdoutParser {
  */
 export function createStdoutParser(): StdoutParser {
   let suppressContinuation = false;
+  let inDiffBlock = false;
+
+  function classifyDiffLine(trimmed: string): TranscriptEntry | null {
+    // Hunk header: @@ -X,Y +X,Y @@
+    if (/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/.test(trimmed)) {
+      return null; // Skip hunk headers — they're noise for the UI
+    }
+    // File header: a/path → b/path
+    if (/^a\/.*→.*b\//.test(trimmed)) {
+      return { kind: "diff", ts: "", changeType: "file_header", text: trimmed.replace(/^a\//, "").replace(/\s*→.*$/, "") };
+    }
+    // Truncation notice: "… omitted N diff line(s) across M additional file(s)/section(s)"
+    if (/^…\s*omitted/.test(trimmed)) {
+      return { kind: "diff", ts: "", changeType: "truncation", text: trimmed };
+    }
+    // Removal (but not --- which is the old-file marker in a file header)
+    if (/^-/.test(trimmed) && !/^---/.test(trimmed)) {
+      return { kind: "diff", ts: "", changeType: "remove", text: trimmed.slice(1) };
+    }
+    // Addition (but not +++ which is the new-file marker)
+    if (/^\+/.test(trimmed) && !/^\+\+\+/.test(trimmed)) {
+      return { kind: "diff", ts: "", changeType: "add", text: trimmed.slice(1) };
+    }
+    // Context line (bare code, no prefix)
+    return { kind: "diff", ts: "", changeType: "context", text: trimmed };
+  }
 
   function parseLine(line: string, ts: string): TranscriptEntry[] {
     const trimmed = line.trim();
@@ -200,11 +227,33 @@ export function createStdoutParser(): StdoutParser {
       return [{ kind: "system", ts, text: trimmed }];
     }
 
+    // ── Diff block detection ──────────────────────────────────────────
+    // After "┊ review diff", subsequent non-┊ lines are diff content
+    if (inDiffBlock) {
+      if (trimmed.includes(TOOL_OUTPUT_PREFIX)) {
+        inDiffBlock = false;
+        // Fall through to normal ┊ handling below
+      } else if (!trimmed) {
+        return [];
+      } else {
+        const diff = classifyDiffLine(trimmed);
+        return diff ? [{ ...diff, ts }] : [];
+      }
+    }
+
     // ── ┊-prefixed lines ──────────────────────────────────────────────
     if (trimmed.includes(TOOL_OUTPUT_PREFIX)) {
       if (isAssistantToolLine(trimmed)) {
         suppressContinuation = false;
         return [{ kind: "thinking", ts, text: extractAssistantText(trimmed) }];
+      }
+
+      // Detect "┊ review diff" — signals start of diff output (no emoji/verb/duration)
+      const afterPipe = trimmed.replace(/^┊\s*/, "").trim();
+      if (/^review\s+diff$/.test(afterPipe)) {
+        suppressContinuation = false;
+        inDiffBlock = true;
+        return []; // Marker only — no visible output
       }
 
       const toolInfo = parseToolCompletionLine(trimmed);
@@ -284,6 +333,7 @@ export function createStdoutParser(): StdoutParser {
 
   function reset(): void {
     suppressContinuation = false;
+    inDiffBlock = false;
   }
 
   return { parseLine, reset };
