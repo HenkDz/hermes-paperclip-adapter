@@ -26,22 +26,25 @@ import type {
 } from "@paperclipai/adapter-utils";
 
 import {
-  runChildProcess,
   buildPaperclipEnv,
   renderTemplate,
   ensureAbsoluteDirectory,
+  appendWithCap,
+  runningProcesses,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
   HERMES_CLI,
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
+  DEFAULT_IDLE_TIMEOUT_SEC,
   DEFAULT_MODEL,
   DEFAULT_DELIVERY_TARGET,
   DEFAULT_MEMORY_SCOPE,
   VALID_PROVIDERS,
   VALID_DELIVERY_TARGETS,
   VALID_MEMORY_SCOPES,
+  DEFAULT_RESUME_STRATEGY,
 } from "../shared/constants.js";
 
 import {
@@ -55,7 +58,10 @@ import {
 } from "./profiles.js";
 
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as nodePath from "node:path";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { homedir } from "node:os";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -355,6 +361,76 @@ function extractFinalResponseBlock(stdout: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Session usage from Hermes SQLite DB
+// ---------------------------------------------------------------------------
+
+/**
+ * Read token usage and cost from the Hermes session database.
+ *
+ * Hermes tracks cumulative token counts (input, output, cache) in its SQLite
+ * state.db but does NOT print them to stdout in quiet mode. After the subprocess
+ * exits, we query the DB to get the final usage for this session.
+ *
+ * The DB lives at <hermes_home>/state.db (or <profile_path>/state.db).
+ */
+function readSessionUsageFromDb(
+  sessionId: string,
+  hermesHomeOverride?: string,
+): { usage: UsageSummary; costUsd: number } | null {
+  if (!sessionId) return null;
+
+  try {
+    // Resolve the DB path from the profile's HERMES_HOME or default
+    const hermesHome = hermesHomeOverride
+      || process.env.HERMES_HOME
+      || nodePath.join(homedir(), ".hermes");
+    const dbPath = nodePath.join(hermesHome, "state.db");
+
+    // Check DB exists before querying
+    fsSync.accessSync(dbPath, fsSync.constants.R_OK);
+
+    // Use python3 to query SQLite (available wherever Hermes is installed).
+    // This avoids adding better-sqlite3 as a Node.js dependency.
+    const pythonScript = [
+      "import sqlite3, json",
+      "conn = sqlite3.connect('" + dbPath.replace(/'/g, "\\'") + "')",
+      "conn.row_factory = sqlite3.Row",
+      "row = conn.execute('SELECT input_tokens, output_tokens, cache_read_tokens, estimated_cost_usd, actual_cost_usd FROM sessions WHERE id = ?', ('" + sessionId + "',)).fetchone()",
+      "conn.close()",
+      "if row:",
+      "    print(json.dumps({'input_tokens': row['input_tokens'] or 0, 'output_tokens': row['output_tokens'] or 0, 'cache_read_tokens': row['cache_read_tokens'] or 0, 'estimated_cost_usd': row['estimated_cost_usd'] or 0, 'actual_cost_usd': row['actual_cost_usd'] or 0}))",
+      "else:",
+      "    print('')",
+    ].join("\n");
+
+    const result = execSync(`python3 -c "${pythonScript.replace(/"/g, '\\"')}"`, {
+      encoding: "utf-8",
+      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+
+    if (!result) return null;
+
+    const data = JSON.parse(result);
+    const inputTokens = (data.input_tokens as number) || 0;
+    const outputTokens = (data.output_tokens as number) || 0;
+    const cacheReadTokens = (data.cache_read_tokens as number) || 0;
+
+    // Skip if both are zero (session not yet written to DB, e.g. very short runs)
+    if (inputTokens === 0 && outputTokens === 0) return null;
+
+    return {
+      usage: { inputTokens, outputTokens, ...(cacheReadTokens > 0 ? { cachedInputTokens: cacheReadTokens } : {}) },
+      costUsd: (data.actual_cost_usd as number) || (data.estimated_cost_usd as number) || 0,
+    };
+  } catch {
+    // Non-fatal — DB read failure shouldn't block the adapter result.
+    // Common reasons: DB not yet written (race), profile path wrong, python3 missing.
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Output parsing
 // ---------------------------------------------------------------------------
 
@@ -419,6 +495,142 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Activity-aware child process runner
+// ---------------------------------------------------------------------------
+
+type ChildProcessWithEvents = ChildProcess & {
+  on(event: "error", listener: (err: Error) => void): ChildProcess;
+  on(
+    event: "close",
+    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
+  ): ChildProcess;
+};
+
+/**
+ * Spawn a child process with a two-tier timeout strategy:
+ *
+ * 1. **Idle timeout** (`idleTimeoutSec`): Kill if no stdout/stderr activity for
+ *    N seconds. Every data event resets the timer. This catches hung processes,
+ *    stuck API calls, and infinite loops producing no output — while allowing
+ *    long-running builds or LLM inference that continuously produce output.
+ *
+ * 2. **Hard max timeout** (`maxTimeoutSec`): Unconditional kill after N seconds
+ *    regardless of activity. Safety net against runaway processes.
+ *
+ * When idle timeout fires, a log message is emitted before SIGTERM.
+ * The grace period (SIGTERM → SIGKILL) uses `graceSec` from the adapter utils
+ * runningProcesses map (so the server's terminate endpoint can also trigger it).
+ */
+function runChildProcessWithIdleTimeout(
+  runId: string,
+  command: string,
+  args: string[],
+  opts: {
+    cwd: string;
+    env: Record<string, string>;
+    idleTimeoutSec: number;
+    maxTimeoutSec: number;
+    graceSec: number;
+    onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  },
+): Promise<{ exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; idleKilled: boolean }> {
+  return new Promise((resolve, reject) => {
+    const mergedEnv = { ...process.env, ...opts.env } as NodeJS.ProcessEnv;
+
+    const child = spawn(command, args, {
+      cwd: opts.cwd,
+      env: mergedEnv,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    }) as ChildProcessWithEvents;
+
+    let timedOut = false;
+    let idleKilled = false;
+    let stdout = "";
+    let stderr = "";
+    let logChain: Promise<void> = Promise.resolve();
+
+    // Register with Paperclip's running processes map (for server terminate endpoint)
+    runningProcesses.set(runId, { child, graceSec: opts.graceSec });
+
+    // ── Idle timeout timer: resets on every stdout/stderr data event ──
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleKilled = true;
+        timedOut = true;
+        opts.onLog("stdout", `\n[hermes] IDLE TIMEOUT: No output for ${opts.idleTimeoutSec}s. Terminating subprocess.\n`)
+          .catch(() => {});
+        child.kill("SIGTERM");
+        // SIGKILL after grace period (same pattern as adapter-utils)
+        setTimeout(() => {
+          if (!child.killed) {
+            child.kill("SIGKILL");
+          }
+        }, Math.max(1, opts.graceSec) * 1000);
+      }, opts.idleTimeoutSec * 1000);
+    };
+
+    // Start the idle timer
+    resetIdleTimer();
+
+    // ── Hard max timeout: unconditional kill regardless of activity ──
+    const maxTimer = setTimeout(() => {
+      timedOut = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      opts.onLog("stdout", `\n[hermes] MAX TIMEOUT: Run exceeded ${opts.maxTimeoutSec}s hard limit. Terminating.\n`)
+        .catch(() => {});
+      child.kill("SIGTERM");
+      setTimeout(() => {
+        if (!child.killed) {
+          child.kill("SIGKILL");
+        }
+      }, Math.max(1, opts.graceSec) * 1000);
+    }, opts.maxTimeoutSec * 1000);
+
+    // ── Stream handlers: capture output + reset idle timer ──
+    child.stdout?.on("data", (chunk: unknown) => {
+      const text = String(chunk);
+      stdout = appendWithCap(stdout, text);
+      logChain = logChain
+        .then(() => opts.onLog("stdout", text))
+        .catch(() => {});
+      resetIdleTimer(); // Activity! Reset idle timer.
+    });
+
+    child.stderr?.on("data", (chunk: unknown) => {
+      const text = String(chunk);
+      stderr = appendWithCap(stderr, text);
+      logChain = logChain
+        .then(() => opts.onLog("stderr", text))
+        .catch(() => {});
+      resetIdleTimer(); // Activity! Reset idle timer.
+    });
+
+    // ── Cleanup ──
+    const cleanup = () => {
+      if (maxTimer) clearTimeout(maxTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      runningProcesses.delete(runId);
+    };
+
+    child.on("error", (err: Error) => {
+      cleanup();
+      reject(new Error(`Failed to start "${command}": ${err.message}`));
+    });
+
+    child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      void logChain.finally(() => {
+        resolve({ exitCode: code, signal, timedOut, stdout, stderr, idleKilled });
+      });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main execute
 // ---------------------------------------------------------------------------
 
@@ -429,8 +641,6 @@ export async function execute(
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
-  const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
-  const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
 
@@ -571,13 +781,67 @@ export async function execute(
   // system is designed for human-attended interactive sessions.
   args.push("--yolo");
 
-  // Session resume — controlled by memoryScope
-  const prevSessionId = cfgString(
-    (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
-  );
+  // Session resume — controlled by memoryScope + resumeStrategy
+  const prevSessionParams = ctx.runtime?.sessionParams as Record<string, unknown> | null;
+  const prevSessionId = cfgString(prevSessionParams?.sessionId);
+  const resumeStrategy = cfgString(config.resumeStrategy) || DEFAULT_RESUME_STRATEGY;
   const persistSession = memoryScope !== "ephemeral";
-  if (persistSession && prevSessionId) {
+
+  // Determine whether to resume the previous session
+  let shouldResume = false;
+  let resumeReason = "";
+
+  if (!persistSession) {
+    resumeReason = "ephemeral memory scope — always fresh";
+  } else if (!prevSessionId) {
+    resumeReason = "no previous session";
+  } else if (resumeStrategy === "always") {
+    shouldResume = true;
+    resumeReason = "resumeStrategy=always";
+  } else if (resumeStrategy === "never") {
+    resumeReason = "resumeStrategy=never — starting fresh";
+  } else {
+    // "smart" (default) — decide based on previous run outcome
+    const prevOutcome = cfgString(prevSessionParams?.previousRunOutcome) || "";
+    const prevHadContextError = cfgBoolean(prevSessionParams?.previousRunHadContextError);
+
+    if (!prevOutcome) {
+      // sessionParams exists but no outcome metadata (legacy or first smart run)
+      shouldResume = true;
+      resumeReason = `no previous outcome recorded, defaulting to resume (session: ${prevSessionId.slice(0, 12)}…)`;
+    } else if (prevOutcome === "success") {
+      shouldResume = true;
+      resumeReason = `previous run exited cleanly (code 0) — resuming`;
+    } else if (prevOutcome === "idle_timeout") {
+      shouldResume = true;
+      resumeReason = `previous run hit idle timeout — resuming (agent was likely working)`;
+    } else if (prevOutcome === "max_timeout") {
+      shouldResume = false;
+      resumeReason = `previous run hit max timeout — starting fresh (session likely bloated)`;
+    } else if (prevOutcome === "sigkill") {
+      shouldResume = false;
+      resumeReason = `previous run was SIGKILLed (grace expired) — starting fresh (session corrupted)`;
+    } else if (prevOutcome === "error" && prevHadContextError) {
+      shouldResume = false;
+      resumeReason = `previous run hit context/token limit — starting fresh`;
+    } else if (prevOutcome === "error") {
+      shouldResume = true;
+      resumeReason = `previous run had a transient error (code != 0) — resuming`;
+    } else {
+      shouldResume = false;
+      resumeReason = `unknown previous outcome "${prevOutcome}" — starting fresh (safe default)`;
+    }
+  }
+
+  if (shouldResume && prevSessionId) {
     args.push("--resume", prevSessionId);
+  }
+
+  if (prevSessionId && !shouldResume) {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Smart resume: NOT resuming session ${prevSessionId}. Reason: ${resumeReason}\n`,
+    );
   }
 
   if (extraArgs?.length) {
@@ -641,15 +905,31 @@ export async function execute(
     });
   }
 
+  // ── Resolve timeout configuration ─────────────────────────────────────
+  // Two-tier timeout strategy:
+  //   - idleTimeoutSec: kill if no stdout/stderr activity for N seconds
+  //   - maxTimeoutSec (formerly timeoutSec): hard kill regardless of activity
+  //   - graceSec: polite shutdown window after SIGTERM
+  const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
+  const idleTimeoutSec = cfgNumber(config.idleTimeoutSec) || DEFAULT_IDLE_TIMEOUT_SEC;
+  const maxTimeoutSec = cfgNumber(config.maxTimeoutSec) || cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
+
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, timeout=${timeoutSec}s)\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, resume=${resumeStrategy}${shouldResume ? "(resuming)" : "(fresh)"}, idle_timeout=${idleTimeoutSec}s, max_timeout=${maxTimeoutSec}s)\n`,
   );
-  if (prevSessionId) {
+  if (shouldResume && prevSessionId) {
     await ctx.onLog(
       "stdout",
-      `[hermes] Resuming session: ${prevSessionId}\n`,
+      `[hermes] Resuming session: ${prevSessionId} (${resumeReason})\n`,
+    );
+  } else if (prevSessionId && !shouldResume) {
+    // Already logged above in the smart resume section
+  } else if (resumeReason) {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Fresh session (${resumeReason})\n`,
     );
   }
 
@@ -677,10 +957,11 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+  const result = await runChildProcessWithIdleTimeout(ctx.runId, hermesCmd, args, {
     cwd,
     env,
-    timeoutSec,
+    idleTimeoutSec,
+    maxTimeoutSec,
     graceSec,
     onLog: wrappedOnLog,
   });
@@ -696,6 +977,31 @@ export async function execute(
     await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
   }
 
+  // ── Read usage from Hermes session DB ──────────────────────────────────
+  // Hermes tracks token counts in SQLite but doesn't print them to stdout.
+  // Query the DB for accurate usage data after the subprocess exits.
+  // Each profile has its own state.db at <profile_dir>/state.db.
+  let hermesHomeForDb: string | undefined;
+  if (profileName && profileName !== "default") {
+    try {
+      hermesHomeForDb = (await ensureProfile(profileName)) ?? undefined;
+    } catch {
+      // Profile resolution failed — fall through to default path
+    }
+  }
+  const dbUsage = readSessionUsageFromDb(parsed.sessionId || "", hermesHomeForDb);
+
+  // Prefer DB usage over regex-parsed usage (more accurate and complete)
+  const finalUsage = dbUsage?.usage || parsed.usage;
+  const finalCost = dbUsage?.costUsd ?? parsed.costUsd;
+
+  if (dbUsage?.usage) {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Usage (from session DB): ${dbUsage.usage.inputTokens} input, ${dbUsage.usage.outputTokens} output${dbUsage.usage.cachedInputTokens ? `, ${dbUsage.usage.cachedInputTokens} cached` : ""}\n`,
+    );
+  }
+
   // ── Build result ───────────────────────────────────────────────────────
   const executionResult: AdapterExecutionResult = {
     exitCode: result.exitCode,
@@ -709,12 +1015,12 @@ export async function execute(
     executionResult.errorMessage = parsed.errorMessage;
   }
 
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
+  if (finalUsage) {
+    executionResult.usage = finalUsage;
   }
 
-  if (parsed.costUsd !== undefined) {
-    executionResult.costUsd = parsed.costUsd;
+  if (finalCost !== undefined) {
+    executionResult.costUsd = finalCost;
   }
 
   // Summary from agent response
@@ -726,14 +1032,51 @@ export async function execute(
   executionResult.resultJson = {
     result: parsed.response || "",
     session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
-    cost_usd: parsed.costUsd ?? null,
+    usage: finalUsage || null,
+    cost_usd: finalCost ?? null,
   };
 
   // Store session ID for next run (respect memory scope)
   if (persistSession && parsed.sessionId) {
-    executionResult.sessionParams = { sessionId: parsed.sessionId };
+    // Determine outcome for smart resume
+    let previousRunOutcome: string;
+    const CONTEXT_ERROR_PATTERNS = [
+      "context", "max length", "token limit", "too long",
+      "prompt exceeds", "BadRequestError",
+    ];
+    const hadContextError = CONTEXT_ERROR_PATTERNS.some(
+      (p) =>
+        (parsed.errorMessage || "").toLowerCase().includes(p) ||
+        (result.stderr || "").toLowerCase().includes(p),
+    );
+
+    if (result.idleKilled) {
+      previousRunOutcome = "idle_timeout";
+    } else if (result.timedOut) {
+      previousRunOutcome = "max_timeout";
+    } else if (result.signal === "SIGKILL") {
+      previousRunOutcome = "sigkill";
+    } else if (result.exitCode !== null && result.exitCode !== 0) {
+      previousRunOutcome = "error";
+    } else {
+      previousRunOutcome = "success";
+    }
+
+    executionResult.sessionParams = {
+      sessionId: parsed.sessionId,
+      previousRunOutcome,
+      previousRunExitCode: result.exitCode,
+      previousRunSignal: result.signal,
+      previousRunTimedOut: result.timedOut,
+      previousRunIdleKilled: result.idleKilled,
+      previousRunHadContextError: hadContextError,
+    };
     executionResult.sessionDisplayId = parsed.sessionId;
+
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Run outcome: ${previousRunOutcome} (exit=${result.exitCode}, signal=${result.signal}, timedOut=${result.timedOut}, idleKilled=${result.idleKilled}) → stored for next smart resume decision\n`,
+    );
   }
 
   return executionResult;

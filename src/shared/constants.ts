@@ -17,6 +17,12 @@ export const DEFAULT_TIMEOUT_SEC = 300;
 /** Grace period after SIGTERM before SIGKILL (seconds). */
 export const DEFAULT_GRACE_SEC = 10;
 
+/**
+ * Default idle timeout: kill the subprocess if no stdout/stderr activity
+ * for this many seconds. Activity resets the timer.
+ */
+export const DEFAULT_IDLE_TIMEOUT_SEC = 120;
+
 /** Default model to use if none specified. */
 export const DEFAULT_MODEL = "anthropic/claude-sonnet-4";
 
@@ -147,6 +153,20 @@ export type MemoryScope = (typeof VALID_MEMORY_SCOPES)[number];
 
 /** Default memory scope. */
 export const DEFAULT_MEMORY_SCOPE: MemoryScope = "session";
+
+// ── Resume strategy ──────────────────────────────────────────────────────
+
+/**
+ * Controls when the adapter resumes a previous session vs starting fresh.
+ *
+ * - "smart" (default): Resume after clean exits and idle timeouts,
+ *   but start fresh after max timeouts, SIGKILL, and context limit errors.
+ * - "always": Always resume if a session ID exists (legacy behavior).
+ * - "never": Never resume, always start fresh.
+ */
+export const VALID_RESUME_STRATEGIES = ["smart", "always", "never"] as const;
+export type ResumeStrategy = (typeof VALID_RESUME_STRATEGIES)[number];
+export const DEFAULT_RESUME_STRATEGY: ResumeStrategy = "smart";
 
 // ── Provider & Model catalog ─────────────────────────────────────────────
 

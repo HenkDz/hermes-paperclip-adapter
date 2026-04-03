@@ -1,16 +1,17 @@
 {
   "name": "@henkey/hermes-paperclip-adapter",
-  "version": "0.3.5",
+  "version": "0.4.1",
+  "author": "HenkDz",
   "description": "Paperclip adapter for Hermes Agent — run Hermes as a managed employee in a Paperclip company",
   "type": "module",
   "license": "MIT",
-  "author": "Nous Research",
   "paperclip": {
     "adapterUiParser": "1.0.0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/NousResearch/hermes-paperclip-adapter"
+    "url": "https://github.com/HenkDz/hermes-paperclip-adapter.git",
+    "branch": "feat/plugin-adapter"
   },
   "keywords": [
     "paperclip",

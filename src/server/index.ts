@@ -104,6 +104,7 @@ export function createServerAdapter(): ServerAdapterModule & {
     models,
     agentConfigurationDoc,
     detectModel: () => detectModel(),
+    supportsLocalAgentJwt: true,
 
     async getConfigSchema(): Promise<AdapterConfigSchema> {
       const profiles = await listProfiles();
