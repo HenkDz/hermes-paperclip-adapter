@@ -1,6 +1,6 @@
 {
   "name": "@henkey/hermes-paperclip-adapter",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "author": "HenkDz",
   "description": "Paperclip adapter for Hermes Agent — run Hermes as a managed employee in a Paperclip company",
   "type": "module",

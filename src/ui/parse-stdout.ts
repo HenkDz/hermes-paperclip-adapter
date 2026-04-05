@@ -181,6 +181,34 @@ function syntheticToolUseId(): string {
  */
 let suppressContinuation = false;
 
+// ── Pre-tool-invocation suppression ────────────────────────────────────────
+// After an assistant/thinking entry, bare lines that look like shell command
+// arguments (curl flags, continuation backslashes) are tool invocation noise,
+// not prose. Hermes outputs tool call arguments as bare lines in quiet mode.
+// Suppress them until a ┊ tool completion line or blank line resets the state.
+let lastWasProse = false;
+let inPreToolBlock = false;
+
+function isToolInvocationLine(line: string): boolean {
+  // Shell commands with flags (not bare command names like prose mentions)
+  // e.g. "curl -s -X POST ..." or "git push origin ..." but not "curl is a tool"
+  // Network commands (require flags to distinguish from prose mentions)
+  if (/^(?:curl|wget|ssh|scp|rsync)\b/.test(line) && / -[A-Za-z]/.test(line)) return true;
+  // Dev-tool commands (bare word + any args = invocation, not prose)
+  if (/^(?:git|npm|bun|yarn|pnpm|docker|kubectl|aws|gh)\b/.test(line) && /\s/.test(line)) return true;
+  // Runtime / package managers
+  if (/^(?:python3?|node|npx|pip3?)\s/.test(line)) return true;
+  // File / shell commands commonly used as tool arguments
+  if (/^(?:cat|less|more|head|tail|grep|egrep|fgrep|sed|awk|find|ls|cd|mkdir|rmdir|rm|mv|cp|chmod|chown|touch|ln|stat|file|wc|sort|uniq|diff|tee|xargs|cut|tr|echo|source|export|env|which|pwd|tar|zip|unzip)\b/.test(line) && /\s/.test(line)) return true;
+  // Flag-only lines: -H, -d, -X, -s, etc. (shell continuation)
+  if (/^-[^-\s]/.test(line)) return true;
+  // Lines ending with backslash (shell line continuation)
+  if (line.endsWith("\\")) return true;
+  // Lines starting with backslash (continuation marker)
+  if (/^\\/.test(line)) return true;
+  return false;
+}
+
 // ── Thinking detection ─────────────────────────────────────────────────────
 
 function isThinkingLine(line: string): boolean {
@@ -219,9 +247,15 @@ export function parseHermesStdoutLine(
     return [];
   }
 
+  // ── Hermes box-drawing banner (╭─ ⚕ Hermes ── / ╰──) ─────────────
+  if (/^╭[─┄┈┅┆│ ⚕]/.test(trimmed) || /^╰[─┄┈┅┆│]/.test(trimmed)) {
+    return [];
+  }
+
   // ── System/adapter messages ────────────────────────────────────────────
   if (trimmed.startsWith("[hermes]") || trimmed.startsWith("[paperclip]")) {
     suppressContinuation = false;
+    lastWasProse = false;
     return [{ kind: "system", ts, text: trimmed }];
   }
 
@@ -229,6 +263,14 @@ export function parseHermesStdoutLine(
   // These are redundant — the tool_call/tool_result pair arrives later from
   // the ┊ completion line. Skip them to avoid duplicate entries.
   if (trimmed.startsWith("[tool]")) {
+    lastWasProse = false;
+    return [];
+  }
+
+  // ── Hermes 0.7.0 "preparing" lines ──────────────────────────────
+  // e.g. "📖 preparing read_file…" — tool announcement, not prose
+  if (/^.\s+preparing\s+/.test(trimmed)) {
+    lastWasProse = false;
     return [];
   }
 
@@ -237,6 +279,7 @@ export function parseHermesStdoutLine(
   // Emit as stderr so Paperclip groups them into the amber accordion.
   if (/^\[\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
     suppressContinuation = false;
+    lastWasProse = false;
     return [{ kind: "stderr", ts, text: trimmed }];
   }
 
@@ -249,6 +292,7 @@ export function parseHermesStdoutLine(
   // ── Session info line ────────────────────────────────────────────────
   if (trimmed.startsWith("session_id:")) {
     suppressContinuation = false;
+    lastWasProse = false;
     return [{ kind: "system", ts, text: trimmed }];
   }
 
@@ -259,6 +303,7 @@ export function parseHermesStdoutLine(
     // The actual "out loud" response arrives as bare lines later.
     if (isAssistantToolLine(trimmed)) {
       suppressContinuation = false;
+      lastWasProse = true;
       return [{ kind: "thinking", ts, text: extractAssistantText(trimmed) }];
     }
 
@@ -272,6 +317,7 @@ export function parseHermesStdoutLine(
 
       // Track this tool result for potential continuation lines
       suppressContinuation = true;
+      lastWasProse = false;
 
       return [
         {
@@ -297,6 +343,7 @@ export function parseHermesStdoutLine(
       .replace(new RegExp(`^${TOOL_OUTPUT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`), "")
       .trim();
     suppressContinuation = false;
+    lastWasProse = false;
     return [{ kind: "stdout", ts, text: stripped }];
   }
 
@@ -362,6 +409,7 @@ export function parseHermesStdoutLine(
       !trimmed.startsWith("print(");
     if (looksLikeProse) {
       suppressContinuation = false;
+      lastWasProse = true;
       return [{ kind: "assistant", ts, text: trimmed }];
     }
     // Still looks like continuation code — suppress and keep tracking
@@ -388,8 +436,40 @@ export function parseHermesStdoutLine(
     return [{ kind: "stderr", ts, text: trimmed }];
   }
 
+  // ── Pre-tool-invocation suppression ─────────────────────────────────────
+  // After prose (assistant/thinking), bare lines that look like shell commands
+  // are tool invocation arguments, not assistant text. Suppress until a ┊
+  // completion line or blank line resets the state.
+  if (inPreToolBlock) {
+    if (!trimmed) {
+      inPreToolBlock = false;
+      return [];
+    }
+    if (trimmed.startsWith(TOOL_OUTPUT_PREFIX)) {
+      inPreToolBlock = false;
+      lastWasProse = false;
+      // Fall through to ┊ handling below (can't re-enter, emit as stdout)
+      const stripped = trimmed
+        .replace(/^\[done\]\s*/, "")
+        .replace(new RegExp(`^${TOOL_OUTPUT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`), "")
+        .trim();
+      return [{ kind: "stdout", ts, text: stripped }];
+    }
+    // Still in tool args — suppress
+    return [];
+  }
+
+  if (lastWasProse && !inPreToolBlock) {
+    if (isToolInvocationLine(trimmed)) {
+      inPreToolBlock = true;
+      lastWasProse = false;
+      return [];
+    }
+  }
+
   // ── Bare line = actual assistant output ────────────────────────────────
   // In quiet mode, all ┊ lines are internal activity (tools, inner thoughts).
   // Bare lines are the assistant's final "out loud" response.
+  lastWasProse = true;
   return [{ kind: "assistant", ts, text: trimmed }];
 }

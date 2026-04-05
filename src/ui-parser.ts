@@ -171,6 +171,28 @@ export function createStdoutParser(): StdoutParser {
   let suppressContinuation = false;
   let inDiffBlock = false;
 
+  // ── Pre-tool-invocation suppression ────────────────────────────────────
+  let lastWasProse = false;
+  let inPreToolBlock = false;
+
+  function isToolInvocationLine(line: string): boolean {
+    // Network commands (require flags to distinguish from prose mentions)
+    if (/^(?:curl|wget|ssh|scp|rsync)\b/.test(line) && / -[A-Za-z]/.test(line)) return true;
+    // Dev-tool commands (bare word + any args = invocation, not prose)
+    if (/^(?:git|npm|bun|yarn|pnpm|docker|kubectl|aws|gh)\b/.test(line) && /\s/.test(line)) return true;
+    // Runtime / package managers
+    if (/^(?:python3?|node|npx|pip3?)\s/.test(line)) return true;
+    // File / shell commands commonly used as tool arguments
+    if (/^(?:cat|less|more|head|tail|grep|egrep|fgrep|sed|awk|find|ls|cd|mkdir|rmdir|rm|mv|cp|chmod|chown|touch|ln|stat|file|wc|sort|uniq|diff|tee|xargs|cut|tr|echo|source|export|env|which|pwd|tar|zip|unzip)\b/.test(line) && /\s/.test(line)) return true;
+    // Flag-only lines: -H, -d, -X, -s, etc. (shell continuation)
+    if (/^-[^-\s]/.test(line)) return true;
+    // Lines ending with backslash (shell line continuation)
+    if (line.endsWith("\\")) return true;
+    // Lines starting with backslash (continuation marker)
+    if (/^\\/.test(line)) return true;
+    return false;
+  }
+
   function classifyDiffLine(trimmed: string): TranscriptEntry | null {
     // Hunk header: @@ -X,Y +X,Y @@
     if (/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/.test(trimmed)) {
@@ -204,17 +226,32 @@ export function createStdoutParser(): StdoutParser {
       return [];
     }
 
+    // ── Hermes box-drawing banner (╭─ ⚕ Hermes ── / ╰──) ─────────────
+    if (/^╭[─┄┈┅┆│ ⚕]/.test(trimmed) || /^╰[─┄┈┅┆│]/.test(trimmed)) {
+      return [];
+    }
+
     if (trimmed.startsWith("[hermes]") || trimmed.startsWith("[paperclip]")) {
       suppressContinuation = false;
+      lastWasProse = false;
       return [{ kind: "system", ts, text: trimmed }];
     }
 
     if (trimmed.startsWith("[tool]")) {
+      lastWasProse = false;
+      return [];
+    }
+
+    // ── Hermes 0.7.0 "preparing" lines ──────────────────────────────
+    // e.g. "📖 preparing read_file…" — tool announcement, not prose
+    if (/^.\s+preparing\s+/.test(trimmed)) {
+      lastWasProse = false;
       return [];
     }
 
     if (/^\[\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
       suppressContinuation = false;
+      lastWasProse = false;
       return [{ kind: "stderr", ts, text: trimmed }];
     }
 
@@ -224,6 +261,7 @@ export function createStdoutParser(): StdoutParser {
 
     if (trimmed.startsWith("session_id:")) {
       suppressContinuation = false;
+      lastWasProse = false;
       return [{ kind: "system", ts, text: trimmed }];
     }
 
@@ -245,6 +283,7 @@ export function createStdoutParser(): StdoutParser {
     if (trimmed.includes(TOOL_OUTPUT_PREFIX)) {
       if (isAssistantToolLine(trimmed)) {
         suppressContinuation = false;
+        lastWasProse = true;
         return [{ kind: "thinking", ts, text: extractAssistantText(trimmed) }];
       }
 
@@ -252,6 +291,7 @@ export function createStdoutParser(): StdoutParser {
       const afterPipe = trimmed.replace(/^┊\s*/, "").trim();
       if (/^review\s+diff$/.test(afterPipe)) {
         suppressContinuation = false;
+        lastWasProse = false;
         inDiffBlock = true;
         return []; // Marker only — no visible output
       }
@@ -263,6 +303,7 @@ export function createStdoutParser(): StdoutParser {
           ? `${toolInfo.detail}  ${toolInfo.duration}`
           : toolInfo.detail;
         suppressContinuation = true;
+        lastWasProse = false;
         return [
           { kind: "tool_call", ts, name: toolInfo.name, input: { detail: toolInfo.detail }, toolUseId: id },
           { kind: "tool_result", ts, toolUseId: id, content: detailText, isError: toolInfo.hasError },
@@ -274,6 +315,7 @@ export function createStdoutParser(): StdoutParser {
         .replace(new RegExp(`^${TOOL_OUTPUT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`), "")
         .trim();
       suppressContinuation = false;
+      lastWasProse = false;
       return [{ kind: "stdout", ts, text: stripped }];
     }
 
@@ -315,6 +357,7 @@ export function createStdoutParser(): StdoutParser {
         !codeKeywords.some((kw) => trimmed.startsWith(kw));
       if (looksLikeProse) {
         suppressContinuation = false;
+        lastWasProse = true;
         return [{ kind: "assistant", ts, text: trimmed }];
       }
       return [];
@@ -325,15 +368,45 @@ export function createStdoutParser(): StdoutParser {
       return [{ kind: "thinking", ts, text: trimmed.replace(/^💭\s*/, "") }];
     }
     if (trimmed.startsWith("Error:") || trimmed.startsWith("ERROR:") || trimmed.startsWith("Traceback")) {
+      lastWasProse = false;
       return [{ kind: "stderr", ts, text: trimmed }];
     }
 
+    // ── Pre-tool-invocation suppression ─────────────────────────────
+    if (inPreToolBlock) {
+      if (!trimmed) {
+        inPreToolBlock = false;
+        return [];
+      }
+      if (trimmed.startsWith(TOOL_OUTPUT_PREFIX)) {
+        inPreToolBlock = false;
+        lastWasProse = false;
+        const stripped = trimmed
+          .replace(/^\[done\]\s*/, "")
+          .replace(new RegExp(`^${TOOL_OUTPUT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`), "")
+          .trim();
+        return [{ kind: "stdout", ts, text: stripped }];
+      }
+      return [];
+    }
+
+    if (lastWasProse && !inPreToolBlock) {
+      if (isToolInvocationLine(trimmed)) {
+        inPreToolBlock = true;
+        lastWasProse = false;
+        return [];
+      }
+    }
+
+    lastWasProse = true;
     return [{ kind: "assistant", ts, text: trimmed }];
   }
 
   function reset(): void {
     suppressContinuation = false;
     inDiffBlock = false;
+    lastWasProse = false;
+    inPreToolBlock = false;
   }
 
   return { parseLine, reset };

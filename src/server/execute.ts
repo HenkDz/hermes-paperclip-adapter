@@ -261,6 +261,24 @@ interface ParsedOutput {
 // ---------------------------------------------------------------------------
 
 /** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
+// ---------------------------------------------------------------------------
+// Server-side stdout noise filter (for resultJson / run summary extraction)
+// ---------------------------------------------------------------------------
+
+function isToolInvocationNoise(line: string): boolean {
+  // Bare shell/tool commands that Hermes outputs as quiet-mode tool arguments.
+  // These are invocation noise, not assistant prose.
+  if (/^(?:curl|wget|ssh|scp|rsync)\b/.test(line) && / -[A-Za-z]/.test(line)) return true;
+  if (/^(?:git|npm|bun|yarn|pnpm|docker|kubectl|aws|gh)\b/.test(line) && /\s/.test(line)) return true;
+  if (/^(?:python3?|node|npx|pip3?)\s/.test(line)) return true;
+  if (/^(?:cat|less|head|tail|grep|egrep|sed|awk|find|ls|cd|mkdir|rm|mv|cp|chmod|chown|touch|ln|stat|file|wc|sort|uniq|diff|tee|xargs|cut|tr|echo|source|export|env|which|pwd|tar|zip|unzip)\b/.test(line) && /\s/.test(line)) return true;
+  // Flag-only continuation lines: -H, -d, -X, -s, etc.
+  if (/^-[^-\s]/.test(line)) return true;
+  if (line.endsWith("\\")) return true;
+  if (/^\\/.test(line)) return true;
+  return false;
+}
+
 function cleanResponse(raw: string): string {
   // Track whether we're inside a tool-call block (┊ 💻, ┊ 📖, etc.)
   // Continuation lines of multi-line commands don't start with ┊,
@@ -272,6 +290,8 @@ function cleanResponse(raw: string): string {
     const t = line.trim();
     if (!t) return true; // keep blank lines for paragraph separation
     if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
+    // ── Hermes CLI box-drawing banner (╭─ ⚕ Hermes ── / ╰──) ───────────
+    if (/^╭[─┄┈┅┆│ ⚕]/.test(t) || /^╰[─┄┈┅┆│]/.test(t)) return false;
     if (t.startsWith("session_id:")) return false;
     if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
     if (/^\[done\]\s*┊/.test(t)) return false;
@@ -306,6 +326,15 @@ function cleanResponse(raw: string): string {
 
     // Status emoji alone (e.g. ✅, ❌ at start of line)
     if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t)) return false;
+
+    // ── Hermes 0.7.0 "preparing" lines ──────────────────────────────
+    if (/^.\s+preparing\s+/.test(t)) {
+      inToolBlock = true;
+      return false;
+    }
+
+    // ── Bare shell/tool command lines (invocation noise, not prose) ──
+    if (isToolInvocationNoise(t)) return false;
 
     // Continuation lines inside a tool block (code body from multi-line commands)
     if (inToolBlock) return false;
@@ -348,8 +377,16 @@ function extractFinalResponseBlock(stdout: string): string {
   }
 
   if (lastToolIdx >= 0) {
-    // Take everything after the last tool line, skip leading blanks
-    const remaining = lines.slice(lastToolIdx + 1);
+    // Multi-line tool commands (e.g. curl with -H/-d continuation lines) span
+    // several stdout lines after the ┊ header. Skip past the header and all
+    // continuation lines until a blank line marks the boundary with the actual
+    // response text.
+    let endOfToolBlock = lastToolIdx + 1;
+    while (endOfToolBlock < lines.length && lines[endOfToolBlock].trim() !== "") {
+      endOfToolBlock++;
+    }
+    // endOfToolBlock now points at the blank separator (or end of text)
+    const remaining = lines.slice(endOfToolBlock);
     const firstNonEmpty = remaining.findIndex((l) => l.trim() !== "");
     if (firstNonEmpty >= 0) {
       return cleanResponse(remaining.slice(firstNonEmpty).join("\n"));
@@ -532,6 +569,7 @@ function runChildProcessWithIdleTimeout(
     maxTimeoutSec: number;
     graceSec: number;
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+    onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
   },
 ): Promise<{ exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; idleKilled: boolean }> {
   return new Promise((resolve, reject) => {
@@ -543,6 +581,13 @@ function runChildProcessWithIdleTimeout(
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     }) as ChildProcessWithEvents;
+
+    // Report child PID to Paperclip so the heartbeat reaper can track it
+    // across server restarts instead of declaring "process lost".
+    if (opts.onSpawn && child.pid) {
+      opts.onSpawn({ pid: child.pid, startedAt: new Date().toISOString() })
+        .catch(() => {}); // non-critical
+    }
 
     let timedOut = false;
     let idleKilled = false;
@@ -964,6 +1009,7 @@ export async function execute(
     maxTimeoutSec,
     graceSec,
     onLog: wrappedOnLog,
+    onSpawn: ctx.onSpawn,
   });
 
   // ── Parse output ───────────────────────────────────────────────────────
