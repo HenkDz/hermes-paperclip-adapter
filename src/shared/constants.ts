@@ -11,8 +11,8 @@ export const ADAPTER_LABEL = "Hermes Agent";
 /** Default CLI binary name. */
 export const HERMES_CLI = "hermes";
 
-/** Default timeout for a single execution run (seconds). */
-export const DEFAULT_TIMEOUT_SEC = 300;
+/** Default timeout for a single execution run (seconds). Safety net only — idle timeout is the primary kill mechanism. */
+export const DEFAULT_TIMEOUT_SEC = 14400;
 
 /** Grace period after SIGTERM before SIGKILL (seconds). */
 export const DEFAULT_GRACE_SEC = 10;

@@ -621,11 +621,84 @@ function runChildProcessWithIdleTimeout(
     // Start the idle timer
     resetIdleTimer();
 
-    // ── Hard max timeout: unconditional kill regardless of activity ──
+    // ── Dual idle timeout: command-in-flight awareness ──
+    //
+    // When the agent dispatches a long-running command (npm install, docker
+    // build, sleep, deployment poll), Hermes produces no output until the
+    // command finishes. The short idle timeout would kill it prematurely.
+    //
+    // Solution: track whether a tool command is "in flight". When we see
+    // a tool dispatch line (┊ emoji + preparing), switch to an extended
+    // idle timeout. When we see a tool result (line ending with timing
+    // like "1.2s") or a new tool starting, switch back to the short one.
+    //
+    // - idleTimeoutSec (short): no command in flight = agent may be stuck
+    // - commandIdleTimeoutSec (extended): command running = agent is waiting
+    //
+    // We detect command lifecycle from the ┊ prefixed lines Hermes emits:
+    //   ┊ 💻 preparing terminal…      → command starting (in flight)
+    //   ┊ 💻 $ <command>              → command dispatched (in flight)
+    //   ┊ 💻 $ <command>  1.2s        → command completed (not in flight)
+    //   ┊ 🔎 grep <pattern>  3.2s     → command completed (not in flight)
+    //   ┊ 📸 snapshot compact  0.3s   → command completed (not in flight)
+    //
+    // A line ending with \d+(\.\d+)?s indicates the tool call finished.
+    const commandIdleTimeoutSec = opts.idleTimeoutSec * 10; // 10x the base idle timeout for in-flight commands
+    let commandInFlight = false;
+
+    // Patterns that indicate a tool call is being dispatched
+    const TOOL_START_PATTERNS = [
+      /┊\s+\S+\s+preparing\s+/i,       // "┊ 💻 preparing terminal…"
+      /┊\s+\S+\s+\$\s+.+$/m,           // "┊ 💻 $ command" (without trailing timing)
+    ];
+
+    // Pattern that indicates a tool call completed (line ends with timing)
+    const TOOL_DONE_PATTERN = /┊\s+.+\s+\d+(\.\d+)?s\s*$/m;
+
+    const updateIdleTimerForChunk = (text: string) => {
+      // Check each line for tool lifecycle markers
+      const lines = text.split(/\r?\n/);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("┊")) continue;
+
+        if (TOOL_DONE_PATTERN.test(trimmed)) {
+          // Tool completed — back to short idle timeout
+          if (commandInFlight) {
+            commandInFlight = false;
+            resetIdleTimer(); // Reset with the shorter timeout
+          }
+        } else if (TOOL_START_PATTERNS.some(p => p.test(trimmed))) {
+          // Tool starting — switch to extended idle timeout
+          if (!commandInFlight) {
+            commandInFlight = true;
+            // Reset idle timer with extended duration
+            if (idleTimer) clearTimeout(idleTimer);
+            idleTimer = setTimeout(() => {
+              idleKilled = true;
+              timedOut = true;
+              opts.onLog("stdout", `\n[hermes] IDLE TIMEOUT: No output for ${commandIdleTimeoutSec}s while command was running. Terminating subprocess.\n`)
+                .catch(() => {});
+              child.kill("SIGTERM");
+              setTimeout(() => {
+                if (!child.killed) {
+                  child.kill("SIGKILL");
+                }
+              }, Math.max(1, opts.graceSec) * 1000);
+            }, commandIdleTimeoutSec * 1000);
+          }
+        }
+      }
+    };
+
+    // ── Hard max timeout: safety net for pathological cases ──
+    // This should rarely trigger. A working agent produces output and
+    // the idle timeout handles stalls. This catches: infinite loops
+    // that produce output, runaway processes, forgotten sessions.
     const maxTimer = setTimeout(() => {
       timedOut = true;
       if (idleTimer) clearTimeout(idleTimer);
-      opts.onLog("stdout", `\n[hermes] MAX TIMEOUT: Run exceeded ${opts.maxTimeoutSec}s hard limit. Terminating.\n`)
+      opts.onLog("stdout", `\n[hermes] MAX TIMEOUT: Run exceeded ${opts.maxTimeoutSec}s safety net. Terminating.\n`)
         .catch(() => {});
       child.kill("SIGTERM");
       setTimeout(() => {
@@ -643,6 +716,7 @@ function runChildProcessWithIdleTimeout(
         .then(() => opts.onLog("stdout", text))
         .catch(() => {});
       resetIdleTimer(); // Activity! Reset idle timer.
+      updateIdleTimerForChunk(text); // Track command lifecycle for dual idle timeout.
     });
 
     child.stderr?.on("data", (chunk: unknown) => {
@@ -951,10 +1025,18 @@ export async function execute(
   }
 
   // ── Resolve timeout configuration ─────────────────────────────────────
-  // Two-tier timeout strategy:
-  //   - idleTimeoutSec: kill if no stdout/stderr activity for N seconds
-  //   - maxTimeoutSec (formerly timeoutSec): hard kill regardless of activity
-  //   - graceSec: polite shutdown window after SIGTERM
+  //
+  // Philosophy: never interrupt a working agent. The ONLY reason to kill
+  // a run is clear unresponsiveness — no stdout/stderr activity.
+  //
+  //   - idleTimeoutSec: PRIMARY kill mechanism. No output for N seconds
+  //     = agent is stuck/unresponsive. This is the signal that matters.
+  //   - maxTimeoutSec: SAFETY NET only. A generous hard ceiling for
+  //     pathological cases (infinite loop that produces output, runaways).
+  //     A working agent should never hit this — idle timeout catches real
+  //     stalls. Default: 4 hours.
+  //   - graceSec: polite shutdown window after SIGTERM.
+  //
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const idleTimeoutSec = cfgNumber(config.idleTimeoutSec) || DEFAULT_IDLE_TIMEOUT_SEC;
   const maxTimeoutSec = cfgNumber(config.maxTimeoutSec) || cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
@@ -962,7 +1044,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, resume=${resumeStrategy}${shouldResume ? "(resuming)" : "(fresh)"}, idle_timeout=${idleTimeoutSec}s, max_timeout=${maxTimeoutSec}s)\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, resume=${resumeStrategy}${shouldResume ? "(resuming)" : "(fresh)"}, idle_timeout=${idleTimeoutSec}s (commands: ${idleTimeoutSec * 10}s), max_timeout=${maxTimeoutSec}s (safety net))\n`,
   );
   if (shouldResume && prevSessionId) {
     await ctx.onLog(
