@@ -14,6 +14,8 @@
  *   -w/--worktree      isolated git worktree
  *   -v/--verbose       verbose output
  *   --checkpoints      filesystem checkpoints
+ *   --yolo             bypass dangerous-command approval prompts (agents have no TTY)
+ *   --source           session source tag for filtering
  */
 
 import type {
@@ -33,8 +35,14 @@ import {
   HERMES_CLI,
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
+  DEFAULT_MODEL,
   VALID_PROVIDERS,
 } from "../shared/constants.js";
+
+import {
+  detectModel,
+  resolveProvider,
+} from "./detect-model.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -80,18 +88,18 @@ Title: {{taskTitle}}
 
 1. Work on the task using your tools
 2. When done, mark the issue as completed:
-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+   \`curl -s -X PATCH -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -d '{"status":"done"}'\`
 3. Post a completion comment on the issue summarizing what you did:
-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
+   \`curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
 4. If this issue has a parent (check the issue body or comments for references like TRA-XX), post a brief notification on the parent issue so the parent owner knows:
-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
+   \`curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
 {{/taskId}}
 
 {{#commentId}}
 ## Comment on This Issue
 
 Someone commented. Read it:
-   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
 
 Address the comment, POST a reply if needed, then continue working.
 {{/commentId}}
@@ -100,17 +108,17 @@ Address the comment, POST a reply if needed, then continue working.
 ## Heartbeat Wake — Check for Work
 
 1. List ALL open issues assigned to you (todo, backlog, in_progress):
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
 
 2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
-   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
+   - Read the issue details: \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
    - Do the work in the project directory: {{projectName}}
    - When done, mark complete and post a comment (see Workflow steps 2-4 above)
 
 3. If no issues assigned to you, check for unassigned issues:
-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+   \`curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
    If you find a relevant issue, assign it to yourself:
-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
+   \`curl -s -X PATCH -H "Authorization: Bearer $PAPERCLIP_API_KEY" "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
 
 4. If truly nothing to do, report briefly what you checked.
 {{/noTask}}`;
@@ -304,19 +312,47 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
-  const config = (ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
-  const model = cfgString(config.model);
-  const provider = cfgString(config.provider);
+  const model = cfgString(config.model) || DEFAULT_MODEL;
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
+  const maxTurns = cfgNumber(config.maxTurnsPerRun);
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
+
+  // ── Resolve provider (defense in depth) ────────────────────────────────
+  // Priority chain:
+  //   1. Explicit provider in adapterConfig (user override)
+  //   2. Provider from ~/.hermes/config.yaml (detected at runtime)
+  //   3. Provider inferred from model name prefix
+  //   4. "auto" (let Hermes decide)
+  //
+  // This ensures that even if the agent was created before provider tracking
+  // was added, or if the model was changed without updating provider, the
+  // correct provider is still used.
+  let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
+  const explicitProvider = cfgString(config.provider);
+
+  if (!explicitProvider) {
+    try {
+      detectedConfig = await detectModel();
+    } catch {
+      // Non-fatal — detection failure shouldn't block execution
+    }
+  }
+
+  const { provider: resolvedProvider, resolvedFrom } = resolveProvider({
+    explicitProvider,
+    detectedProvider: detectedConfig?.provider,
+    detectedModel: detectedConfig?.model,
+    model,
+  });
 
   // ── Build prompt ───────────────────────────────────────────────────────
   const prompt = buildPrompt(ctx, config);
@@ -331,13 +367,18 @@ export async function execute(
     args.push("-m", model);
   }
 
-  // Only pass --provider if it's a valid Hermes provider choice.
-  if (provider && (VALID_PROVIDERS as readonly string[]).includes(provider)) {
-    args.push("--provider", provider);
+  // Always pass --provider when we have a resolved one (not "auto").
+  // "auto" means Hermes will decide on its own — no need to pass it.
+  if (resolvedProvider !== "auto") {
+    args.push("--provider", resolvedProvider);
   }
 
   if (toolsets) {
     args.push("-t", toolsets);
+  }
+
+  if (maxTurns && maxTurns > 0) {
+    args.push("--max-turns", String(maxTurns));
   }
 
   if (worktreeMode) args.push("-w");
@@ -347,6 +388,13 @@ export async function execute(
   // Tag sessions as "tool" source so they don't clutter the user's session history.
   // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
   args.push("--source", "tool");
+
+  // Bypass Hermes dangerous-command approval prompts.
+  // Paperclip agents run as non-interactive subprocesses with no TTY,
+  // so approval prompts would always timeout and deny legitimate commands
+  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
+  // system is designed for human-attended interactive sessions.
+  args.push("--yolo");
 
   // Session resume
   const prevSessionId = cfgString(
@@ -367,6 +415,8 @@ export async function execute(
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
+  if ((ctx as any).authToken && !env.PAPERCLIP_API_KEY)
+    env.PAPERCLIP_API_KEY = (ctx as any).authToken;
   const taskId = cfgString(ctx.config?.taskId);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
@@ -387,7 +437,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model ?? "configured-default"}, timeout=${timeoutSec}s)\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(
@@ -444,8 +494,8 @@ export async function execute(
     exitCode: result.exitCode,
     signal: result.signal,
     timedOut: result.timedOut,
-    provider: provider || null,
-    model: model || null,
+    provider: resolvedProvider,
+    model,
   };
 
   if (parsed.errorMessage) {
