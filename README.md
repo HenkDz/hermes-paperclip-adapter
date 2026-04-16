@@ -4,6 +4,11 @@ A [Paperclip](https://paperclip.ing) adapter that runs [Hermes Agent](https://gi
 
 Forked from [NousResearch/hermes-paperclip-adapter](https://github.com/NousResearch/hermes-paperclip-adapter) with significant enhancements.
 
+## Branches
+
+- `main` — the current external/plugin adapter for Paperclip's adapter plugin system
+- `legacy-pre-plugin` — the old manual/pre-plugin adapter line, kept for reference and synced with upstream
+
 ## What's Different From Upstream
 
 | Feature | Upstream (Nous) | This Fork |
