@@ -139,9 +139,11 @@ export function inferProviderFromModel(model: string): string | undefined {
 /**
  * Resolve the correct provider for a model, using a priority chain:
  *
- *   1. Explicit provider from adapterConfig (highest priority — user override)
- *   2. Provider from Hermes config file — ONLY if the config model matches
- *      the requested model (otherwise the config provider is for a different model)
+ *   1. Provider from Hermes config file — if it has an explicit provider AND
+ *      the config model matches the requested model. This is the user's actual
+ *      runtime configuration and takes precedence over stale adapterConfig values.
+ *   2. Explicit provider from adapterConfig — user override when Hermes config
+ *      doesn't specify a provider (e.g. profile without provider set)
  *   3. Provider inferred from model name prefix
  *   4. "auto" (let Hermes figure it out — lowest priority)
  *
@@ -151,34 +153,46 @@ export function inferProviderFromModel(model: string): string | undefined {
 export function resolveProvider(options: {
   /** Explicit provider from adapterConfig (user override) */
   explicitProvider?: string | null;
-  /** Provider detected from Hermes config file */
-  detectedProvider?: string;
-  /** Model name from Hermes config file (to check consistency) */
-  detectedModel?: string;
+  /** Ordered provider/model detections from Hermes config files */
+  detectedConfigs?: Array<{
+    provider?: string;
+    model?: string;
+    source?: string;
+  } | null | undefined>;
   /** Model name to infer from if no explicit/detected provider */
   model?: string;
 }): { provider: string; resolvedFrom: string } {
-  const { explicitProvider, detectedProvider, detectedModel, model } = options;
+  const { explicitProvider, detectedConfigs = [], model } = options;
+  const normalizedModel = model?.trim().toLowerCase();
 
-  // 1. Explicit provider from adapterConfig — user override, always wins
+  // 1. Prefer an exact model+provider match from detected Hermes configs.
+  //    This lets us honor the selected profile config first, then fall back to
+  //    the default Hermes config for explicit model overrides.
+  if (normalizedModel) {
+    for (const detected of detectedConfigs) {
+      const detectedProvider = detected?.provider?.trim();
+      const detectedModel = detected?.model?.trim().toLowerCase();
+      if (
+        detectedProvider &&
+        detectedModel &&
+        (VALID_PROVIDERS as readonly string[]).includes(detectedProvider) &&
+        detectedModel === normalizedModel
+      ) {
+        return {
+          provider: detectedProvider,
+          resolvedFrom: detected?.source ? `${detected.source}:modelMatch` : "hermesConfig:modelMatch",
+        };
+      }
+    }
+  }
+
+  // 2. Explicit provider from adapterConfig — user override when there is no
+  //    exact config match for the requested model.
   if (explicitProvider && (VALID_PROVIDERS as readonly string[]).includes(explicitProvider)) {
     return { provider: explicitProvider, resolvedFrom: "adapterConfig" };
   }
 
-  // 2. Provider from Hermes config file — but ONLY if the config model matches
-  //    the requested model. Otherwise the config provider is for a different model
-  //    and would cause exactly the kind of routing bug we're fixing.
-  if (
-    detectedProvider &&
-    detectedModel &&
-    (VALID_PROVIDERS as readonly string[]).includes(detectedProvider) &&
-    // Config model matches requested model (exact or case-insensitive)
-    detectedModel.toLowerCase() === model?.toLowerCase()
-  ) {
-    return { provider: detectedProvider, resolvedFrom: "hermesConfig" };
-  }
-
-  // 3. Infer from model name prefix
+  // 3. Infer from model name prefix.
   if (model) {
     const inferred = inferProviderFromModel(model);
     if (inferred) {
@@ -186,6 +200,6 @@ export function resolveProvider(options: {
     }
   }
 
-  // 4. Let Hermes auto-detect
+  // 4. Let Hermes auto-detect.
   return { provider: "auto", resolvedFrom: "auto" };
 }

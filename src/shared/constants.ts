@@ -175,25 +175,19 @@ export const DEFAULT_RESUME_STRATEGY: ResumeStrategy = "smart";
  * Keys must match VALID_PROVIDERS entries.
  */
 export const PROVIDER_LABELS: Record<string, string> = {
-  auto: "Auto (from profile config)",
+  auto: "Auto (resolve from Hermes config)",
   openrouter: "OpenRouter",
   nous: "Nous Portal",
-  openai_codex: "OpenAI Codex",
+  "openai-codex": "OpenAI Codex",
   copilot: "GitHub Copilot",
   "copilot-acp": "GitHub Copilot ACP",
   anthropic: "Anthropic",
   huggingface: "Hugging Face",
   zai: "Z.AI / GLM",
-  kimi_coding: "Kimi / Moonshot",
+  "kimi-coding": "Kimi / Moonshot",
   minimax: "MiniMax",
-  minimax_cn: "MiniMax (China)",
+  "minimax-cn": "MiniMax (China)",
   kilocode: "Kilo Code",
-  alibaba: "Alibaba Cloud",
-  opencode_zen: "OpenCode Zen",
-  opencode_go: "OpenCode Go",
-  ai_gateway: "AI Gateway",
-  deepseek: "DeepSeek",
-  custom: "Custom endpoint",
 };
 
 /**

@@ -40,6 +40,8 @@ import {
   DEFAULT_DELIVERY_TARGET,
   VALID_MEMORY_SCOPES,
   DEFAULT_MEMORY_SCOPE,
+  VALID_PROVIDERS,
+  PROVIDER_LABELS,
 } from "../shared/constants.js";
 import { agentConfigurationDoc, models } from "../index.js";
 import { execute } from "./execute.js";
@@ -118,6 +120,17 @@ export function createServerAdapter(): ServerAdapterModule & {
             options: profiles.map((p) => ({ label: p.name, value: p.name })),
             default: "default",
             hint: "Isolated Hermes profile with its own config, memories, and skills.",
+          },
+          {
+            key: "provider",
+            label: "Provider",
+            type: "select",
+            options: VALID_PROVIDERS.map((provider) => ({
+              label: PROVIDER_LABELS[provider] ?? provider,
+              value: provider,
+            })),
+            default: "auto",
+            hint: "Optional override. Auto resolves from matching Hermes config first, then model inference.",
           },
           {
             key: "memoryScope",

@@ -290,8 +290,8 @@ function cleanResponse(raw: string): string {
     const t = line.trim();
     if (!t) return true; // keep blank lines for paragraph separation
     if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
-    // ── Hermes CLI box-drawing banner (╭─ ⚕ Hermes ── / ╰──) ───────────
-    if (/^╭[─┄┈┅┆│ ⚕]/.test(t) || /^╰[─┄┈┅┆│]/.test(t)) return false;
+    // ── Hermes CLI box-drawing banner (╭─ ⚕ Hermes ── / ╰── / │ content) ──
+    if (/^╭[─┄┈┅┆│ ⚕]/.test(t) || /^╰[─┄┈┅┆│]/.test(t) || /^│/.test(t)) return false;
     if (t.startsWith("session_id:")) return false;
     if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
     if (/^\[done\]\s*┊/.test(t)) return false;
@@ -600,22 +600,54 @@ function runChildProcessWithIdleTimeout(
 
     // ── Idle timeout timer: resets on every stdout/stderr data event ──
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const initialResponseIdleTimeoutSec = Math.max(opts.idleTimeoutSec * 3, 300);
+    let sawMeaningfulOutput = false;
 
-    const resetIdleTimer = () => {
+    const isBenignStartupLine = (trimmed: string): boolean =>
+      /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) ||
+      /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) ||
+      /Successfully registered all tools/.test(trimmed) ||
+      /MCP [Ss]erver/.test(trimmed) ||
+      /tool registered successfully/.test(trimmed) ||
+      /Application initialized/.test(trimmed);
+
+    const chunkHasMeaningfulOutput = (text: string): boolean => {
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (isBenignStartupLine(trimmed)) continue;
+        return true;
+      }
+      return false;
+    };
+
+    const scheduleIdleTimer = (timeoutSec: number, reason: "initial" | "regular" | "command") => {
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleKilled = true;
         timedOut = true;
-        opts.onLog("stdout", `\n[hermes] IDLE TIMEOUT: No output for ${opts.idleTimeoutSec}s. Terminating subprocess.\n`)
+        const message =
+          reason === "initial"
+            ? `\n[hermes] INITIAL IDLE TIMEOUT: No meaningful output for ${timeoutSec}s while waiting for the first model response. Terminating subprocess.\n`
+            : reason === "command"
+              ? `\n[hermes] IDLE TIMEOUT: No output for ${timeoutSec}s while command was running. Terminating subprocess.\n`
+              : `\n[hermes] IDLE TIMEOUT: No output for ${timeoutSec}s. Terminating subprocess.\n`;
+        opts.onLog("stdout", message)
           .catch(() => {});
         child.kill("SIGTERM");
-        // SIGKILL after grace period (same pattern as adapter-utils)
         setTimeout(() => {
           if (!child.killed) {
             child.kill("SIGKILL");
           }
         }, Math.max(1, opts.graceSec) * 1000);
-      }, opts.idleTimeoutSec * 1000);
+      }, timeoutSec * 1000);
+    };
+
+    const resetIdleTimer = () => {
+      scheduleIdleTimer(
+        sawMeaningfulOutput ? opts.idleTimeoutSec : initialResponseIdleTimeoutSec,
+        sawMeaningfulOutput ? "regular" : "initial",
+      );
     };
 
     // Start the idle timer
@@ -672,20 +704,8 @@ function runChildProcessWithIdleTimeout(
           // Tool starting — switch to extended idle timeout
           if (!commandInFlight) {
             commandInFlight = true;
-            // Reset idle timer with extended duration
-            if (idleTimer) clearTimeout(idleTimer);
-            idleTimer = setTimeout(() => {
-              idleKilled = true;
-              timedOut = true;
-              opts.onLog("stdout", `\n[hermes] IDLE TIMEOUT: No output for ${commandIdleTimeoutSec}s while command was running. Terminating subprocess.\n`)
-                .catch(() => {});
-              child.kill("SIGTERM");
-              setTimeout(() => {
-                if (!child.killed) {
-                  child.kill("SIGKILL");
-                }
-              }, Math.max(1, opts.graceSec) * 1000);
-            }, commandIdleTimeoutSec * 1000);
+            sawMeaningfulOutput = true;
+            scheduleIdleTimer(commandIdleTimeoutSec, "command");
           }
         }
       }
@@ -715,6 +735,9 @@ function runChildProcessWithIdleTimeout(
       logChain = logChain
         .then(() => opts.onLog("stdout", text))
         .catch(() => {});
+      if (!sawMeaningfulOutput && chunkHasMeaningfulOutput(text)) {
+        sawMeaningfulOutput = true;
+      }
       resetIdleTimer(); // Activity! Reset idle timer.
       updateIdleTimerForChunk(text); // Track command lifecycle for dual idle timeout.
     });
@@ -725,6 +748,9 @@ function runChildProcessWithIdleTimeout(
       logChain = logChain
         .then(() => opts.onLog("stderr", text))
         .catch(() => {});
+      if (!sawMeaningfulOutput && chunkHasMeaningfulOutput(text)) {
+        sawMeaningfulOutput = true;
+      }
       resetIdleTimer(); // Activity! Reset idle timer.
     });
 
@@ -777,27 +803,51 @@ export async function execute(
   //   2. Model/provider from profile's config.yaml or default Hermes config
   //   3. Provider inferred from model name prefix
   //   4. "auto" (let Hermes decide) / DEFAULT_MODEL as last resort
-  let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
+  let profileDetectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
+  let defaultDetectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   const explicitProvider = cfgString(config.provider);
   const explicitModel = cfgString(config.model);
 
-  // Detect model/provider from profile or default Hermes config.
-  // This is used both for resolving the model fallback and for provider detection.
+  // Detect model/provider from the selected profile first, then the default
+  // Hermes config. This lets explicit model overrides still resolve against the
+  // user's global default config when the selected profile is pinned elsewhere.
   if (!explicitProvider || !explicitModel) {
     try {
-      detectedConfig = await detectModel(undefined, profileName);
+      profileDetectedConfig = await detectModel(undefined, profileName);
+    } catch {
+      // Non-fatal — detection failure shouldn't block execution
+    }
+    try {
+      defaultDetectedConfig = await detectModel();
     } catch {
       // Non-fatal — detection failure shouldn't block execution
     }
   }
 
-  // Resolve model: explicit config > profile config > hardcoded default
-  const model = explicitModel || detectedConfig?.model || DEFAULT_MODEL;
+  const detectedConfigs = [
+    profileDetectedConfig
+      ? {
+          ...profileDetectedConfig,
+          source:
+            profileName && profileName !== "default"
+              ? `profile:${profileName}`
+              : "defaultConfig",
+        }
+      : null,
+    defaultDetectedConfig
+      ? {
+          ...defaultDetectedConfig,
+          source: "defaultConfig",
+        }
+      : null,
+  ];
+
+  // Resolve model: explicit config > selected profile/default config > hardcoded default
+  const model = explicitModel || profileDetectedConfig?.model || defaultDetectedConfig?.model || DEFAULT_MODEL;
 
   const { provider: resolvedProvider, resolvedFrom } = resolveProvider({
     explicitProvider,
-    detectedProvider: detectedConfig?.provider,
-    detectedModel: detectedConfig?.model,
+    detectedConfigs,
     model,
   });
 
@@ -809,7 +859,7 @@ export async function execute(
   if (instructionsFilePath) {
     // Resolve cwd early for instructions path resolution
     const instrCwd =
-      cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+      cfgString(ctx.config?.workspaceDir) || cfgString(config.cwd) || ".";
     const resolvedPath = nodePath.resolve(instrCwd, instructionsFilePath);
     const instructionsDir = `${nodePath.dirname(resolvedPath)}/`;
     try {
@@ -994,7 +1044,7 @@ export async function execute(
 
   // ── Resolve working directory ──────────────────────────────────────────
   const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+    cfgString(ctx.config?.workspaceDir) || cfgString(config.cwd) || ".";
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {

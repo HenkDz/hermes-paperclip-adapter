@@ -226,8 +226,8 @@ export function createStdoutParser(): StdoutParser {
       return [];
     }
 
-    // ── Hermes box-drawing banner (╭─ ⚕ Hermes ── / ╰──) ─────────────
-    if (/^╭[─┄┈┅┆│ ⚕]/.test(trimmed) || /^╰[─┄┈┅┆│]/.test(trimmed)) {
+    // ── Hermes box-drawing banner (╭─ ⚕ Hermes ── / ╰── / │ content) ──
+    if (/^╭[─┄┈┅┆│ ⚕]/.test(trimmed) || /^╰[─┄┈┅┆│]/.test(trimmed) || /^│/.test(trimmed)) {
       return [];
     }
 

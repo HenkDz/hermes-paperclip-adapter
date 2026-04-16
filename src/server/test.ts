@@ -187,34 +187,72 @@ async function checkProviderConsistency(
   if (!model) return null;
 
   const explicitProvider = asString(config.provider);
+  const profileName = asString(config.profile);
 
-  // Try to detect from Hermes config
-  let detectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
+  // Try to detect from the selected profile first, then the default config.
+  let profileDetectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
+  let defaultDetectedConfig: Awaited<ReturnType<typeof detectModel>> | null = null;
   try {
-    detectedConfig = await detectModel();
+    profileDetectedConfig = await detectModel(undefined, profileName);
+  } catch {
+    // Non-fatal
+  }
+  try {
+    defaultDetectedConfig = await detectModel();
   } catch {
     // Non-fatal
   }
 
+  const detectedConfigs = [
+    profileDetectedConfig
+      ? {
+          ...profileDetectedConfig,
+          source:
+            profileName && profileName !== "default"
+              ? `profile:${profileName}`
+              : "defaultConfig",
+        }
+      : null,
+    defaultDetectedConfig
+      ? {
+          ...defaultDetectedConfig,
+          source: "defaultConfig",
+        }
+      : null,
+  ];
+
   const { provider: resolved, resolvedFrom } = resolveProvider({
     explicitProvider,
-    detectedProvider: detectedConfig?.provider,
-    detectedModel: detectedConfig?.model,
+    detectedConfigs,
     model,
   });
 
-  // If provider was explicitly set but doesn't match what Hermes config says,
-  // that's worth flagging.
-  if (explicitProvider && detectedConfig?.provider && explicitProvider !== detectedConfig.provider) {
+  const exactMatch = detectedConfigs.find((detected) => {
+    const detectedProvider = detected?.provider?.trim();
+    const detectedModel = detected?.model?.trim().toLowerCase();
+    return (
+      detectedProvider &&
+      detectedModel &&
+      model.trim().toLowerCase() === detectedModel
+    );
+  });
+
+  // If provider was explicitly set but conflicts with an exact config match,
+  // flag it so the user understands which override will win.
+  if (
+    explicitProvider &&
+    exactMatch?.provider &&
+    explicitProvider !== exactMatch.provider
+  ) {
     return {
       level: "warn",
-      message: `Provider mismatch: adapterConfig has "${explicitProvider}" but ~/.hermes/config.yaml has "${detectedConfig.provider}". Using adapterConfig value.`,
-      hint: `Model "${model}" may not work correctly with provider "${explicitProvider}". Consider aligning with your Hermes config or removing the explicit provider to use auto-detection.`,
+      message: `Provider mismatch: adapterConfig has "${explicitProvider}" but Hermes config for model "${model}" resolves to "${exactMatch.provider}". Using adapterConfig value.`,
+      hint: `Leave provider blank/auto to follow the detected config for "${model}", or keep the explicit override if you intend to force a different backend.`,
       code: "hermes_provider_mismatch",
     };
   }
 
-  // If provider was auto-detected (not explicitly set), log what was resolved
+  // If provider was auto-detected (not explicitly set), log what was resolved.
   if (!explicitProvider && resolvedFrom !== "auto") {
     return {
       level: "info",
@@ -223,12 +261,12 @@ async function checkProviderConsistency(
     };
   }
 
-  // If we couldn't resolve any provider, warn
+  // If we couldn't resolve any provider, warn.
   if (resolvedFrom === "auto" && !explicitProvider) {
     return {
       level: "warn",
       message: `Could not determine provider for model "${model}" — will use Hermes auto-detection`,
-      hint: "Set an explicit provider in the agent config or ensure ~/.hermes/config.yaml has a matching provider for this model.",
+      hint: "Set an explicit provider in the agent config or keep your Hermes config aligned with the model you want to run.",
       code: "hermes_provider_unknown",
     };
   }
