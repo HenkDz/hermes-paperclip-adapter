@@ -45,6 +45,9 @@ export function buildHermesConfig(
 
   // Execution limits
   ac.timeoutSec = DEFAULT_TIMEOUT_SEC;
+  if (v.maxTurnsPerRun > 0) {
+    ac.maxTurnsPerRun = Math.floor(v.maxTurnsPerRun);
+  }
 
   // Reasoning effort
   ac.reasoningEffort = DEFAULT_REASONING_EFFORT;

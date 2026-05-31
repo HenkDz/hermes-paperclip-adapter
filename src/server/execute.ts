@@ -14,6 +14,7 @@
  *   -w/--worktree      isolated git worktree
  *   -v/--verbose       verbose output
  *   --checkpoints      filesystem checkpoints
+ *   --max-turns N      maximum tool-calling iterations per turn
  *   --yolo             bypass dangerous-command approval prompts (agents have no TTY)
  *   --source           session source tag for filtering
  */
@@ -69,6 +70,11 @@ import { homedir } from "node:os";
 
 function cfgString(v: unknown): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+function cfgRecord(v: unknown): Record<string, unknown> | undefined {
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : undefined;
 }
 function cfgNumber(v: unknown): number | undefined {
   return typeof v === "number" ? v : undefined;
@@ -157,14 +163,38 @@ function buildPrompt(
   // Task metadata comes from the heartbeat context (contextSnapshot),
   // NOT from adapterConfig. Paperclip populates context with taskId, wakeReason, etc.
   const context = (ctx.context ?? {}) as Record<string, unknown>;
-  const taskId = cfgString(context?.taskId);
-  const taskTitle = cfgString(context?.taskTitle) || cfgString(context?.issueTitle) || "";
-  const taskBody = cfgString(context?.taskBody) || cfgString(context?.issueDescription) || cfgString(context?.description) || "";
-  const commentId = cfgString(context?.commentId) || "";
-  const wakeReason = cfgString(context?.wakeReason) || "";
+  const paperclipIssue = cfgRecord(context.paperclipIssue);
+  const taskId =
+    cfgString(context.taskId) ||
+    cfgString(context.issueId) ||
+    cfgString(paperclipIssue?.id) ||
+    cfgString(ctx.runtime?.taskKey) ||
+    cfgString(ctx.config?.taskId);
+  const taskTitle =
+    cfgString(context.taskTitle) ||
+    cfgString(context.issueTitle) ||
+    cfgString(paperclipIssue?.title) ||
+    cfgString(ctx.config?.taskTitle) ||
+    "";
+  const taskBody =
+    cfgString(context.taskBody) ||
+    cfgString(context.issueDescription) ||
+    cfgString(context.description) ||
+    cfgString(paperclipIssue?.description) ||
+    cfgString(paperclipIssue?.body) ||
+    cfgString(context.paperclipTaskMarkdown) ||
+    cfgString(ctx.config?.taskBody) ||
+    "";
+  const commentId =
+    cfgString(context.commentId) ||
+    cfgString(context.latestCommentId) ||
+    cfgString(context.wakeCommentId) ||
+    cfgString(ctx.config?.commentId) ||
+    "";
+  const wakeReason = cfgString(context.wakeReason) || cfgString(ctx.config?.wakeReason) || "";
   const agentName = ctx.agent?.name || "Hermes Agent";
-  const companyName = cfgString(ctx.config?.companyName) || "";
-  const projectName = cfgString(ctx.config?.projectName) || "";
+  const companyName = cfgString(context.companyName) || cfgString(ctx.config?.companyName) || "";
+  const projectName = cfgString(context.projectName) || cfgString(ctx.config?.projectName) || "";
 
   // Build API URL — ensure it has the /api path
   let paperclipApiUrl =
@@ -889,12 +919,13 @@ function runChildProcessWithIdleTimeout(
 export async function execute(
   ctx: AdapterExecutionContext,
 ): Promise<AdapterExecutionResult> {
-  const config = (ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
+  const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
+  const maxTurns = cfgNumber(config.maxTurnsPerRun);
 
   // Profile support
   const profileName = cfgString(config.profile);
@@ -1041,6 +1072,10 @@ export async function execute(
     args.push("-t", toolsets);
   }
 
+  if (maxTurns && maxTurns > 0) {
+    args.push("--max-turns", String(Math.floor(maxTurns)));
+  }
+
   // Worktree mode (backward compat)
   if (cfgBoolean(config.worktreeMode) === true) args.push("-w");
   if (cfgBoolean(config.checkpoints) === true) args.push("--checkpoints");
@@ -1126,7 +1161,13 @@ export async function execute(
 
   // ── Inject agent identity and delivery target ────────────────────────
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
-  const taskId = cfgString((ctx.context as Record<string, unknown>)?.taskId);
+  const runContext = (ctx.context ?? {}) as Record<string, unknown>;
+  const runIssue = cfgRecord(runContext.paperclipIssue);
+  const taskId =
+    cfgString(runContext.taskId) ||
+    cfgString(runContext.issueId) ||
+    cfgString(runIssue?.id) ||
+    cfgString(ctx.runtime?.taskKey);
   if (taskId) env.PAPERCLIP_TASK_ID = taskId;
 
   // Inject the agent JWT so curl commands can authenticate as this agent.
@@ -1201,7 +1242,7 @@ export async function execute(
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, resume=${resumeStrategy}${shouldResume ? "(resuming)" : "(fresh)"}, idle_timeout=${idleTimeoutSec}s (commands: ${idleTimeoutSec * 10}s), max_timeout=${maxTimeoutSec}s (safety net))\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], memory=${memoryScope}${profileName && profileName !== "default" ? `, profile=${profileName}` : ""}${deliveryTarget !== "none" ? `, deliver=${deliveryTarget}` : ""}, resume=${resumeStrategy}${shouldResume ? "(resuming)" : "(fresh)"}${maxTurns && maxTurns > 0 ? `, max_turns=${Math.floor(maxTurns)}` : ""}, idle_timeout=${idleTimeoutSec}s (commands: ${idleTimeoutSec * 10}s), max_timeout=${maxTimeoutSec}s (safety net))\n`,
   );
   if (shouldResume && prevSessionId) {
     await ctx.onLog(
@@ -1319,6 +1360,9 @@ export async function execute(
     session_id: parsed.sessionId || null,
     usage: finalUsage || null,
     cost_usd: finalCost ?? null,
+    total_cost_usd: finalCost ?? null,
+    costUsd: finalCost ?? null,
+    totalCostUsd: finalCost ?? null,
   };
 
   // Store session ID for next run (respect memory scope)

@@ -151,6 +151,13 @@ export function createServerAdapter(): ServerAdapterModule & {
             hint: "Recommended. Keeps Hermes in -Q mode so transcripts and stored summaries do not echo the full prompt/banner.",
           },
           {
+            key: "maxTurnsPerRun",
+            label: "Max Turns Per Run",
+            type: "number",
+            default: 0,
+            hint: "Optional. Sends --max-turns N to Hermes. Use 0 to keep the Hermes profile/default value.",
+          },
+          {
             key: "deliveryTarget",
             label: "Delivery Target",
             type: "select",

@@ -138,9 +138,10 @@ npm install @henkey/hermes-paperclip-adapter
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `timeoutSec` | number | `300` | (Legacy) Falls back to if `maxTimeoutSec` not set |
-| `maxTimeoutSec` | number | `300` | Hard kill regardless of activity. Safety net. |
+| `timeoutSec` | number | `14400` | (Legacy) Falls back to if `maxTimeoutSec` not set |
+| `maxTimeoutSec` | number | `14400` | Hard kill regardless of activity. Safety net. |
 | `idleTimeoutSec` | number | `120` | Kill if no stdout/stderr for N seconds. Resets on activity. |
+| `maxTurnsPerRun` | number | `0` | Optional Hermes `--max-turns` value. `0` keeps the Hermes profile/default setting. |
 | `graceSec` | number | `10` | Grace period after SIGTERM before SIGKILL |
 
 **Recommended timeouts by role:**
