@@ -234,7 +234,7 @@ const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
  * the literal word "from" as a session ID, which poisoned the runtime
  * state permanently.
  */
-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+(\d{8}_\d{6}_[a-f0-9]+)/i;
+const SESSION_ID_REGEX_LEGACY = /\b(?:session(?:[_ ](?:id|saved))?|resumed session)[:\s]+(\d{8}_\d{6}_[a-f0-9]+)/i;
 
 /** Validate a parsed session ID against Hermes format. Rejects garbage matches. */
 function isValidHermesSessionId(id: string): boolean {
@@ -279,22 +279,48 @@ function isToolInvocationNoise(line: string): boolean {
   return false;
 }
 
+function isHeredocTerminatorWithDuration(line: string): boolean {
+  // Quiet-mode heredoc timing chrome: "PY  0.2s", "EOF  1.2s".
+  return /^[A-Z_][A-Z0-9_]*\s+\d+(?:\.\d+)?s\s*(?:\([\d.]+s\))?$/i.test(line);
+}
+
 function cleanResponse(raw: string): string {
+  raw = stripReviewDiffBlocks(raw);
   // Track whether we're inside a tool-call block (┊ 💻, ┊ 📖, etc.)
   // Continuation lines of multi-line commands don't start with ┊,
   // so we suppress them by remembering we're still in a tool block.
   let inToolBlock = false;
+  let inPromptEcho = false;
   const lines = raw.split("\n");
 
   const filtered = lines.filter((line) => {
     const t = line.trim();
-    if (!t) return true; // keep blank lines for paragraph separation
+    if (!t) {
+      inToolBlock = false;
+      return true; // keep blank lines for paragraph separation
+    }
     if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
-    // ── Hermes CLI box-drawing banner (╭─ ⚕ Hermes ── / ╰── / │ content) ──
-    if (/^╭[─┄┈┅┆│ ⚕]/.test(t) || /^╰[─┄┈┅┆│]/.test(t) || /^│/.test(t)) return false;
+    // ── Hermes CLI box-drawing banner (╭─ ⚕ Hermes ── / ╰── / │ content / ─ ⚕ Hermes ─) ──
+    if (/^╭[─┄┈┅┆│ ⚕]/.test(t) || /^╰[─┄┈┅┆│]/.test(t) || /^│/.test(t) || /^─+\s*⚕\s*Hermes\s*─/.test(t) || /^[─-]{20,}$/.test(t)) return false;
+    if (t === "Resume this session with:" || /^hermes\s+--resume\s+\S+/.test(t) || /^Session:\s+\S+/.test(t) || /^Duration:\s+\S+/.test(t) || /^Messages:\s+\d+/.test(t)) return false;
     if (t.startsWith("session_id:")) return false;
     if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
     if (/^\[done\]\s*┊/.test(t)) return false;
+
+    // Non-quiet mode echoes the entire query/prompt before the agent starts.
+    // Suppress that block so resultJson only contains the final deliverable.
+    if (t.startsWith("Query:")) {
+      inPromptEcho = true;
+      return false;
+    }
+    if (inPromptEcho) {
+      if (t === "Initializing agent..." || /^[─-]{20,}$/.test(t)) {
+        // End of prompt echo / startup prelude.
+        return false;
+      }
+      return false;
+    }
+    if (t === "Initializing agent..." || /^[─-]{20,}$/.test(t)) return false;
 
     // ┊ + emoji (except ┊ 💬) = tool activity line → start tool block, suppress
     // Use \p{Emoji} (not Emoji_Presentation) to catch emoji like ✍️ (U+270D+FE0F)
@@ -320,6 +346,12 @@ function cleanResponse(raw: string): string {
     // Bare duration line ("1.0s") or closing-quote+duration ('"  1.0s')
     // This signals the end of a tool call body
     if (/^["']?\s*\d+\.\d+s\s*$/.test(t)) {
+      inToolBlock = false;
+      return false;
+    }
+
+    // Heredoc terminator + duration: "PY  0.2s", "EOF  1.2s".
+    if (isHeredocTerminatorWithDuration(t)) {
       inToolBlock = false;
       return false;
     }
@@ -353,6 +385,81 @@ function cleanResponse(raw: string): string {
     .trim();
 }
 
+function parseDiffHunkCounts(trimmed: string): { oldCount: number; newCount: number } | null {
+  const match = trimmed.match(/^@@\s+-\d+(?:,(\d+))?\s+\+\d+(?:,(\d+))?\s+@@/);
+  if (!match) return null;
+  return {
+    oldCount: match[1] === undefined ? 1 : Number(match[1]),
+    newCount: match[2] === undefined ? 1 : Number(match[2]),
+  };
+}
+
+function stripReviewDiffBlocks(raw: string): string {
+  const kept: string[] = [];
+  let inDiffBlock = false;
+  let oldRemaining = 0;
+  let newRemaining = 0;
+
+  const consume = (kind: "add" | "remove" | "context") => {
+    if (kind === "add") {
+      newRemaining = Math.max(0, newRemaining - 1);
+    } else if (kind === "remove") {
+      oldRemaining = Math.max(0, oldRemaining - 1);
+    } else {
+      oldRemaining = Math.max(0, oldRemaining - 1);
+      newRemaining = Math.max(0, newRemaining - 1);
+    }
+  };
+
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+
+    if (/^┊\s*review\s+diff$/.test(t)) {
+      inDiffBlock = true;
+      oldRemaining = 0;
+      newRemaining = 0;
+      continue;
+    }
+
+    if (inDiffBlock) {
+      if (!t) {
+        if (oldRemaining > 0 || newRemaining > 0) consume("context");
+        continue;
+      }
+      const hunk = parseDiffHunkCounts(t);
+      if (hunk) {
+        oldRemaining = hunk.oldCount;
+        newRemaining = hunk.newCount;
+        continue;
+      }
+      if (/^a\/.*→.*b\//.test(t) || /^…\s*omitted/.test(t)) {
+        oldRemaining = 0;
+        newRemaining = 0;
+        continue;
+      }
+      if (/^-/.test(t) && !/^---/.test(t)) {
+        consume("remove");
+        continue;
+      }
+      if (/^\+/.test(t) && !/^\+\+\+/.test(t)) {
+        consume("add");
+        continue;
+      }
+      if (oldRemaining > 0 || newRemaining > 0) {
+        consume("context");
+        continue;
+      }
+
+      // Diff hunk is complete and Hermes moved straight into final prose.
+      inDiffBlock = false;
+    }
+
+    kept.push(line);
+  }
+
+  return kept.join("\n");
+}
+
 /**
  * Extract only the final response block from Hermes stdout.
  *
@@ -363,7 +470,7 @@ function cleanResponse(raw: string): string {
 function extractFinalResponseBlock(stdout: string): string {
   // Split at session_id — everything before it is the response area
   const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
-  const text = sessionLineIdx > 0 ? stdout.slice(0, sessionLineIdx) : stdout;
+  const text = stripReviewDiffBlocks(sessionLineIdx > 0 ? stdout.slice(0, sessionLineIdx) : stdout);
   const lines = text.split("\n");
 
   // Find the last tool-activity line (┊ + emoji)
@@ -494,9 +601,9 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     if (legacyId && isValidHermesSessionId(legacyId)) {
       result.sessionId = legacyId;
     }
-    // In non-quiet mode, extract clean response from stdout by
-    // filtering out tool lines, system messages, and noise
-    const cleaned = cleanResponse(stdout);
+    // Non-quiet mode includes banner/query/tool chatter. Reuse the same
+    // final-block extraction logic so resultJson stores only the deliverable.
+    const cleaned = extractFinalResponseBlock(stdout);
     if (cleaned.length > 0) {
       result.response = cleaned;
     }

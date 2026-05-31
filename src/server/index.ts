@@ -144,6 +144,13 @@ export function createServerAdapter(): ServerAdapterModule & {
             hint: "Session = resume within agent, Persistent = survive agent recreation, Ephemeral = fresh every run.",
           },
           {
+            key: "quiet",
+            label: "Quiet Mode",
+            type: "toggle",
+            default: true,
+            hint: "Recommended. Keeps Hermes in -Q mode so transcripts and stored summaries do not echo the full prompt/banner.",
+          },
+          {
             key: "deliveryTarget",
             label: "Delivery Target",
             type: "select",

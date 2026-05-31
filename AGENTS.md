@@ -81,6 +81,7 @@ The adapter returns a `getConfigSchema()` method. Paperclip server serves this a
 | `profile` | select | Dynamic (from `~/.hermes/profiles/`) | `"default"` | Each agent gets isolated Hermes profile |
 | `reasoningEffort` | select | low, medium, high | `"medium"` | `--reasoning-effort` flag |
 | `memoryScope` | select | session, persistent, ephemeral | `"session"` | Controls `--resume` behavior |
+| `quiet` | toggle | true/false | `true` | Recommended. Enables Hermes `-Q` quiet mode so transcripts and stored summaries do not echo the full prompt/banner |
 | `deliveryTarget` | select | none, telegram, discord, slack, whatsapp, signal | `"none"` | Sets HERMES_DELIVERY_TARGET |
 
 **No fork changes needed** — `SchemaConfigFields` is auto-assigned to external adapters in `paperclip-fork/ui/src/adapters/registry.ts`.

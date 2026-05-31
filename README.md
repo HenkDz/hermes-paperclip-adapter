@@ -179,7 +179,7 @@ npm install @henkey/hermes-paperclip-adapter
 |-------|------|---------|-------------|
 | `hermesCommand` | string | `hermes` | Custom CLI binary path |
 | `verbose` | boolean | `false` | Enable verbose output |
-| `quiet` | boolean | `true` | Quiet mode (clean output, no banner/spinner) |
+| `quiet` | boolean | `true` | Quiet mode (clean output, no banner/spinner). Recommended for normal Paperclip runs so transcripts and stored summaries stay clean. |
 | `extraArgs` | string[] | `[]` | Additional CLI arguments |
 | `env` | object | `{}` | Extra environment variables |
 | `promptTemplate` | string | *(built-in)* | Custom prompt template (not recommended — let Paperclip generate managed bundles instead) |

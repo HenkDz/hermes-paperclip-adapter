@@ -4,4 +4,5 @@
  */
 
 export { parseHermesStdoutLine } from "./parse-stdout.js";
+export { createStdoutParser as createHermesStdoutParser } from "../ui-parser.js";
 export { buildHermesConfig } from "./build-config.js";

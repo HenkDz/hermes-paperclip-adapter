@@ -22,9 +22,16 @@
  * ONLY immediately after a tool_result, until a blank line resets the state.
  */
 
-import type { TranscriptEntry } from "@paperclipai/adapter-utils";
+import type { TranscriptEntry as BaseTranscriptEntry } from "@paperclipai/adapter-utils";
 
 import { TOOL_OUTPUT_PREFIX } from "../shared/constants.js";
+
+type TranscriptEntry = BaseTranscriptEntry | {
+  kind: "diff";
+  ts: string;
+  changeType: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation";
+  text: string;
+};
 
 // ── Kaomoji / noise stripping ──────────────────────────────────────────────
 
@@ -48,6 +55,15 @@ function isAssistantToolLine(stripped: string): boolean {
 /** Extract assistant text from a ┊ 💬 line. */
 function extractAssistantText(line: string): string {
   return line.replace(/^[\s┊]*💬\s*/, "").trim();
+}
+
+function stripLeadingToolIcon(text: string): string {
+  // Hermes quiet output prefixes tool lines with a decorative emoji:
+  //   💻 $ curl ...
+  //   ✍️ write file.ts
+  // That emoji is UI chrome, not the tool name. Strip one leading emoji
+  // sequence so the parser sees the real verb (`$`, `write`, `read`, ...).
+  return text.replace(/^(?:\p{Emoji}\uFE0F?(?:\u200D\p{Emoji}\uFE0F?)*)\s+/u, "").trim();
 }
 
 /**
@@ -83,6 +99,7 @@ function parseToolCompletionLine(
   let verbAndDetail = durationMatch
     ? cleaned.slice(0, cleaned.lastIndexOf(durationMatch[0])).trim()
     : cleaned;
+  verbAndDetail = stripLeadingToolIcon(verbAndDetail);
 
   // Check for error suffixes
   const hasError = /\[(?:exit \d+|error|full)\]/.test(verbAndDetail) ||
@@ -155,6 +172,30 @@ function parseToolCompletionLine(
   return { name, detail, duration, hasError };
 }
 
+function buildToolInput(name: string, detail: string): Record<string, unknown> {
+  if (name === "shell") {
+    return { command: detail.replace(/^\$\s*/, "").trim() };
+  }
+  if (name === "read" || name === "write" || name === "write_file" || name === "patch") {
+    return { path: detail };
+  }
+  return { detail };
+}
+
+function buildToolResult(name: string, detail: string, duration: string, hasError: boolean): string {
+  if (name === "shell") {
+    const command = detail.replace(/^\$\s*/, "").trim();
+    return [
+      `command: ${command}`,
+      `status: ${hasError ? "error" : "completed"}`,
+      ...(hasError ? [] : ["exit_code: 0"]),
+      duration ? "" : null,
+      duration ? `duration: ${duration}` : null,
+    ].filter((line): line is string => line !== null).join("\n");
+  }
+  return duration ? `${detail}  ${duration}` : detail;
+}
+
 // ── Synthetic tool ID generation ────────────────────────────────────────────
 
 let toolCallCounter = 0;
@@ -180,6 +221,10 @@ function syntheticToolUseId(): string {
  * and the start of the actual assistant response (bare lines).
  */
 let suppressContinuation = false;
+let inDiffBlock = false;
+let diffOldRemaining = 0;
+let diffNewRemaining = 0;
+let suppressScratchDiffBlock = false;
 
 // ── Pre-tool-invocation suppression ────────────────────────────────────────
 // After an assistant/thinking entry, bare lines that look like shell command
@@ -188,6 +233,12 @@ let suppressContinuation = false;
 // Suppress them until a ┊ tool completion line or blank line resets the state.
 let lastWasProse = false;
 let inPreToolBlock = false;
+
+// Hermes can echo the entire query/prompt in non-quiet/resume output before
+// the agent starts. That prompt belongs in adapter.invoke metadata, not the
+// Nice transcript.
+let inPromptEcho = false;
+let inStartupPrelude = false;
 
 function isToolInvocationLine(line: string): boolean {
   // Shell commands with flags (not bare command names like prose mentions)
@@ -207,6 +258,87 @@ function isToolInvocationLine(line: string): boolean {
   // Lines starting with backslash (continuation marker)
   if (/^\\/.test(line)) return true;
   return false;
+}
+
+function isHeredocTerminatorWithDuration(line: string): boolean {
+  // Hermes sometimes renders Python heredoc terminal output as:
+  //   ┊ 💻 $         python3 - <<'PY'
+  //   PY  0.2s
+  // The second line is CLI/tool timing chrome, not assistant prose.
+  // Keep this scoped to suppressContinuation so normal prose is unaffected.
+  return /^[A-Z_][A-Z0-9_]*\s+\d+(?:\.\d+)?s\s*(?:\([\d.]+s\))?$/i.test(line);
+}
+
+function resetDiffBlock(): void {
+  inDiffBlock = false;
+  diffOldRemaining = 0;
+  diffNewRemaining = 0;
+  suppressScratchDiffBlock = false;
+}
+
+function isScratchDiffPath(filePath: string): boolean {
+  // Hermes often writes short-lived JSON payloads to /tmp before posting to
+  // Paperclip APIs. The write tool itself is useful; the one-line JSON diff
+  // is internal scratch noise and unlike source edits should not get a diff
+  // card in Nice view.
+  return /^(?:\/?tmp\/|\/?var\/tmp\/|\/?private\/tmp\/)/.test(filePath);
+}
+
+function parseDiffHunkHeader(trimmed: string): { oldCount: number; newCount: number } | null {
+  const match = trimmed.match(/^@@\s+-\d+(?:,(\d+))?\s+\+\d+(?:,(\d+))?\s+@@/);
+  if (!match) return null;
+  return {
+    oldCount: match[1] === undefined ? 1 : Number(match[1]),
+    newCount: match[2] === undefined ? 1 : Number(match[2]),
+  };
+}
+
+function consumeDiffLine(kind: "add" | "remove" | "context"): void {
+  if (kind === "add") {
+    diffNewRemaining = Math.max(0, diffNewRemaining - 1);
+  } else if (kind === "remove") {
+    diffOldRemaining = Math.max(0, diffOldRemaining - 1);
+  } else {
+    diffOldRemaining = Math.max(0, diffOldRemaining - 1);
+    diffNewRemaining = Math.max(0, diffNewRemaining - 1);
+  }
+}
+
+function classifyDiffLine(trimmed: string): { entry: TranscriptEntry | null; consumed: boolean } {
+  const hunk = parseDiffHunkHeader(trimmed);
+  if (hunk) {
+    diffOldRemaining = hunk.oldCount;
+    diffNewRemaining = hunk.newCount;
+    return { entry: null, consumed: true };
+  }
+  if (/^a\/.*→.*b\//.test(trimmed)) {
+    diffOldRemaining = 0;
+    diffNewRemaining = 0;
+    const filePath = trimmed.replace(/^a\//, "").replace(/\s*→.*$/, "");
+    suppressScratchDiffBlock = isScratchDiffPath(filePath);
+    return { entry: suppressScratchDiffBlock ? null : { kind: "diff", ts: "", changeType: "file_header", text: filePath }, consumed: true };
+  }
+  if (/^…\s*omitted/.test(trimmed)) {
+    diffOldRemaining = 0;
+    diffNewRemaining = 0;
+    return { entry: suppressScratchDiffBlock ? null : { kind: "diff", ts: "", changeType: "truncation", text: trimmed }, consumed: true };
+  }
+  if (diffOldRemaining <= 0 && diffNewRemaining <= 0) {
+    // Hermes now often emits final prose/markdown bullets immediately after
+    // the last review diff, with no blank/tool separator. Once hunk counts are
+    // consumed, bare lines are prose again — even if they begin with +/-.
+    return { entry: null, consumed: false };
+  }
+  if (/^-/.test(trimmed) && !/^---/.test(trimmed)) {
+    consumeDiffLine("remove");
+    return { entry: suppressScratchDiffBlock ? null : { kind: "diff", ts: "", changeType: "remove", text: trimmed.slice(1) }, consumed: true };
+  }
+  if (/^\+/.test(trimmed) && !/^\+\+\+/.test(trimmed)) {
+    consumeDiffLine("add");
+    return { entry: suppressScratchDiffBlock ? null : { kind: "diff", ts: "", changeType: "add", text: trimmed.slice(1) }, consumed: true };
+  }
+  consumeDiffLine("context");
+  return { entry: suppressScratchDiffBlock ? null : { kind: "diff", ts: "", changeType: "context", text: trimmed }, consumed: true };
 }
 
 // ── Thinking detection ─────────────────────────────────────────────────────
@@ -238,23 +370,74 @@ export function parseHermesStdoutLine(
 ): TranscriptEntry[] {
   const trimmed = line.trim();
 
+  // Hermes review-diff output often has blank separator lines between the
+  // marker, file header, hunk header, and every displayed diff line. Keep the
+  // diff block open across those separators; do not count them as hunk lines.
+  if (inDiffBlock && !trimmed) {
+    suppressContinuation = false;
+    return [];
+  }
+
+  if (inPromptEcho && !trimmed) {
+    return [];
+  }
+
+  if (inStartupPrelude && !trimmed) {
+    return [];
+  }
+
   // ── Blank line → resets continuation suppression ─────────────────────
   // Blank lines signal the boundary between tool activity and the
   // assistant's actual response. After a blank line, bare lines
   // are real output, not command continuation noise.
   if (!trimmed) {
     suppressContinuation = false;
+    inPreToolBlock = false;
+    lastWasProse = false;
     return [];
   }
 
-  // ── Hermes box-drawing banner (╭─ ⚕ Hermes ── / ╰──) ─────────────
-  if (/^╭[─┄┈┅┆│ ⚕]/.test(trimmed) || /^╰[─┄┈┅┆│]/.test(trimmed)) {
+  if (trimmed.startsWith("Query:")) {
+    inPromptEcho = true;
+    inStartupPrelude = false;
+    suppressContinuation = false;
+    resetDiffBlock();
+    lastWasProse = false;
+    inPreToolBlock = false;
+    return [];
+  }
+
+  if (inPromptEcho) {
+    if (trimmed === "Initializing agent...") {
+      inPromptEcho = false;
+      inStartupPrelude = true;
+    }
+    return [];
+  }
+
+  if (inStartupPrelude) {
+    if (trimmed.includes(TOOL_OUTPUT_PREFIX)) {
+      inStartupPrelude = false;
+      // Fall through to normal ┊ handling below.
+    } else {
+      return [];
+    }
+  }
+
+  // ── Hermes box-drawing banner (╭─ ⚕ Hermes ── / ╰── / ─ ⚕ Hermes ─) ───
+  if (/^╭[─┄┈┅┆│ ⚕]/.test(trimmed) || /^╰[─┄┈┅┆│]/.test(trimmed) || /^│/.test(trimmed) || /^─+\s*⚕\s*Hermes\s*─/.test(trimmed) || /^[─-]{20,}$/.test(trimmed)) {
+    return [];
+  }
+
+  // ── Hermes footer / resume hints ─────────────────────────────────────
+  if (trimmed === "Resume this session with:" || /^hermes\s+--resume\s+\S+/.test(trimmed) || /^Session:\s+\S+/.test(trimmed) || /^Duration:\s+\S+/.test(trimmed) || /^Messages:\s+\d+/.test(trimmed)) {
     return [];
   }
 
   // ── System/adapter messages ────────────────────────────────────────────
   if (trimmed.startsWith("[hermes]") || trimmed.startsWith("[paperclip]")) {
     suppressContinuation = false;
+    resetDiffBlock();
     lastWasProse = false;
     return [{ kind: "system", ts, text: trimmed }];
   }
@@ -292,8 +475,23 @@ export function parseHermesStdoutLine(
   // ── Session info line ────────────────────────────────────────────────
   if (trimmed.startsWith("session_id:")) {
     suppressContinuation = false;
+    resetDiffBlock();
     lastWasProse = false;
     return [{ kind: "system", ts, text: trimmed }];
+  }
+
+  // ── Diff block detection ──────────────────────────────────────────
+  // After "┊ review diff", subsequent non-┊ lines are diff content.
+  if (inDiffBlock) {
+    if (trimmed.includes(TOOL_OUTPUT_PREFIX)) {
+      resetDiffBlock();
+      // Fall through to normal ┊ handling below.
+    } else {
+      const diff = classifyDiffLine(trimmed);
+      if (diff.consumed) return diff.entry ? [{ ...diff.entry, ts }] : [];
+      resetDiffBlock();
+      // Fall through and parse this same line as normal prose/output.
+    }
   }
 
   // ── Quiet-mode tool/message lines (prefixed with ┊) ────────────────────
@@ -307,13 +505,23 @@ export function parseHermesStdoutLine(
       return [{ kind: "thinking", ts, text: extractAssistantText(trimmed) }];
     }
 
+    // Detect "┊ review diff" — signals start of diff output (no emoji/verb/duration)
+    const afterPipe = trimmed.replace(/^┊\s*/, "").trim();
+    if (/^review\s+diff$/.test(afterPipe)) {
+      suppressContinuation = false;
+      lastWasProse = false;
+      inDiffBlock = true;
+      diffOldRemaining = 0;
+      diffNewRemaining = 0;
+      return [];
+    }
+
     // Tool completion: ┊ {emoji} {verb} {detail} {duration}
     const toolInfo = parseToolCompletionLine(trimmed);
     if (toolInfo) {
       const id = syntheticToolUseId();
-      const detailText = toolInfo.duration
-        ? `${toolInfo.detail}  ${toolInfo.duration}`
-        : toolInfo.detail;
+      const input = buildToolInput(toolInfo.name, toolInfo.detail);
+      const resultText = buildToolResult(toolInfo.name, toolInfo.detail, toolInfo.duration, toolInfo.hasError);
 
       // Track this tool result for potential continuation lines
       suppressContinuation = true;
@@ -324,14 +532,14 @@ export function parseHermesStdoutLine(
           kind: "tool_call" as const,
           ts,
           name: toolInfo.name,
-          input: { detail: toolInfo.detail },
+          input,
           toolUseId: id,
         },
         {
           kind: "tool_result" as const,
           ts,
           toolUseId: id,
-          content: detailText,
+          content: resultText,
           isError: toolInfo.hasError,
         },
       ] as TranscriptEntry[];
@@ -370,6 +578,11 @@ export function parseHermesStdoutLine(
     }
     // Closing quote + duration: '"  1.0s or "' 1.0s
     if (/^["']\s*\d+\.\d+s\s*$/.test(trimmed)) {
+      suppressContinuation = false;
+      return [];
+    }
+    // Heredoc terminator + duration: "PY  0.2s", "EOF  1.2s".
+    if (isHeredocTerminatorWithDuration(trimmed)) {
       suppressContinuation = false;
       return [];
     }

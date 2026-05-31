@@ -88,6 +88,7 @@ Leave blank to use the default profile.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| quiet | boolean | true | Keep Hermes in quiet mode (\`-Q\`). Recommended for normal Paperclip runs so transcripts and run summaries stay clean. |
 | hermesCommand | string | hermes | Path to hermes CLI binary |
 | verbose | boolean | false | Enable verbose output |
 | extraArgs | string[] | [] | Additional CLI arguments |
