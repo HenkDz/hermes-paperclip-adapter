@@ -921,6 +921,30 @@ export async function execute(
 ): Promise<AdapterExecutionResult> {
   const config = (ctx.config ?? ctx.agent?.adapterConfig ?? {}) as Record<string, unknown>;
 
+  // ── Terminal-status guard (wake-loop fix — upstream #92) ────────────────
+  // If the issue is already done/cancelled, skip spawning Hermes entirely.
+  // This prevents the adapter from re-executing completed work on every
+  // ~30s heartbeat wake, which is a budget time-bomb for unsupervised agents.
+  const wakeContext = (ctx.context ?? {}) as Record<string, unknown>;
+  const paperclipWake = cfgRecord(wakeContext.paperclipWake);
+  const paperclipWakeIssue = cfgRecord(paperclipWake?.issue) as Record<string, string | undefined> | undefined;
+  const issueStatus = cfgString(paperclipWakeIssue?.status)
+    || cfgString(wakeContext.issueStatus)
+    || cfgString(wakeContext.status);
+  if (issueStatus === "done" || issueStatus === "cancelled") {
+    const taskId =
+      cfgString(wakeContext.taskId)
+      || cfgString(wakeContext.issueId)
+      || cfgString(paperclipWakeIssue?.id)
+      || cfgString(cfgRecord(wakeContext.paperclipIssue)?.id as string | undefined)
+      || "";
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Skipping wake — task ${taskId || "(no task id)"} is ${issueStatus}, no-op.\n`,
+    );
+    return { exitCode: 0, signal: null, timedOut: false, summary: `Skipped: issue already ${issueStatus}` };
+  }
+
   // ── Resolve configuration ──────────────────────────────────────────────
   const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
   const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
