@@ -112,6 +112,16 @@ export function parseModelFromConfig(content: string): DetectedModel | null {
 }
 
 /**
+ * Check whether a provider string is allowed.
+ *
+ * Built-in providers are validated against VALID_PROVIDERS.
+ * Any provider starting with "custom:" is always allowed — Hermes
+ * owns validation of custom:<name> providers via the user's config.yaml.
+ */
+const isAllowedProvider = (p: string): boolean =>
+  p.startsWith("custom:") || (VALID_PROVIDERS as readonly string[]).includes(p);
+
+/**
  * Infer a provider from the model name using prefix-based hints.
  *
  * For example:
@@ -175,7 +185,7 @@ export function resolveProvider(options: {
       if (
         detectedProvider &&
         detectedModel &&
-        (VALID_PROVIDERS as readonly string[]).includes(detectedProvider) &&
+        isAllowedProvider(detectedProvider) &&
         detectedModel === normalizedModel
       ) {
         return {
@@ -188,7 +198,7 @@ export function resolveProvider(options: {
 
   // 2. Explicit provider from adapterConfig — user override when there is no
   //    exact config match for the requested model.
-  if (explicitProvider && (VALID_PROVIDERS as readonly string[]).includes(explicitProvider)) {
+  if (explicitProvider && isAllowedProvider(explicitProvider)) {
     return { provider: explicitProvider, resolvedFrom: "adapterConfig" };
   }
 
