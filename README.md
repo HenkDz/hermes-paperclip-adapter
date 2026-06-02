@@ -116,6 +116,17 @@ npm install @henkey/hermes-paperclip-adapter
 
 ## Quick Start
 
+### If Hermes is already built into your Paperclip build
+
+Recent Paperclip builds include a built-in `hermes_local` adapter. In that case, **do not install this package as an external adapter** unless your Paperclip fork explicitly supports external overrides of built-ins.
+
+1. Go to **Agents** and create a new agent
+2. Select adapter type `hermes_local`
+3. Configure the profile, provider/model, and memory scope
+4. Assign issues — Hermes picks them up on the next heartbeat
+
+### If your Paperclip build uses the external adapter plugin system
+
 1. Go to **Settings > Adapters** in your Paperclip instance (`/instance/settings/adapters`)
 2. Click **Install Adapter**
 3. Either:
@@ -124,6 +135,16 @@ npm install @henkey/hermes-paperclip-adapter
 4. Create a Hermes agent in Paperclip with adapter type `hermes_local`
 5. Configure the profile, provider/model, and memory scope
 6. Assign issues — Hermes picks them up on the next heartbeat
+
+### Error: `Adapter type "hermes_local" is a built-in adapter and cannot be overwritten`
+
+This means your Paperclip server already ships a built-in `hermes_local` adapter and its install route refuses external plugins with the same adapter type. `pnpm` is not the cause.
+
+Use one of these paths:
+
+- **Use the built-in adapter**: skip adapter installation and create an agent with adapter type `hermes_local`.
+- **Use this fork as an override**: run a Paperclip build/fork that supports external overrides of built-in adapters. HenkDz/paperclip `master` supports this; removing the external plugin restores the built-in fallback.
+- **Use an older Paperclip without built-in Hermes**: install this package through Settings > Adapters as usual.
 
 ## Configuration Reference
 
