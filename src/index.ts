@@ -9,7 +9,7 @@
  * @packageDocumentation
  */
 
-import { ADAPTER_TYPE, ADAPTER_LABEL } from "./shared/constants.js";
+import { ADAPTER_TYPE, ADAPTER_LABEL, PROVIDER_MODELS, PROVIDER_LABELS } from "./shared/constants.js";
 
 export const type = ADAPTER_TYPE;
 export const label = ADAPTER_LABEL;
@@ -17,11 +17,25 @@ export const label = ADAPTER_LABEL;
 /**
  * Models available through Hermes Agent.
  *
- * Hermes supports any model via any provider. The Paperclip UI should
- * prefer detectModel() plus manual entry over curated placeholder models,
- * since Hermes availability depends on the user's local configuration.
+ * Auto-populated from the PROVIDER_MODELS catalog in constants.ts.
+ * Shows the full model tree grouped by provider.
+ * Users can also type any model manually (Hermes accepts any model).
  */
-export const models: { id: string; label: string }[] = [];
+export const models: { id: string; label: string }[] = (() => {
+  const result: { id: string; label: string }[] = [];
+
+  for (const [provider, modelIds] of Object.entries(PROVIDER_MODELS)) {
+    const providerLabel = PROVIDER_LABELS[provider] ?? provider;
+    for (const modelId of modelIds) {
+      result.push({
+        id: modelId,
+        label: `${modelId} (${providerLabel})`,
+      });
+    }
+  }
+
+  return result;
+})();
 
 /**
  * Documentation shown in the Paperclip UI when configuring a Hermes agent.

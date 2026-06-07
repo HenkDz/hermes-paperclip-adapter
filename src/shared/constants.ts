@@ -44,6 +44,13 @@ export const VALID_PROVIDERS = [
   "minimax",
   "minimax-cn",
   "kilocode",
+  "opencode-go",
+  "opencode-zen",
+  "opencode-codex",
+  "xai",
+  "xai-oauth",
+  "bedrock",
+  "ai-gateway",
 ] as const;
 
 /**
@@ -84,6 +91,14 @@ export const MODEL_PREFIX_PROVIDER_HINTS: [string, string][] = [
   ["mistral", "auto"],
   // HuggingFace models (org/model format)
   ["huggingface/", "huggingface"],
+  // OpenCode models
+  ["opencode-", "auto"],
+  // xAI / Grok models
+  ["grok-", "xai-oauth"],
+  ["grok/", "xai-oauth"],
+  // AWS Bedrock models
+  ["bedrock/", "bedrock"],
+  ["anthropic.", "bedrock"],
 ];
 
 /** Regex to extract session ID from Hermes CLI output. */
@@ -188,6 +203,13 @@ export const PROVIDER_LABELS: Record<string, string> = {
   minimax: "MiniMax",
   "minimax-cn": "MiniMax (China)",
   kilocode: "Kilo Code",
+  "opencode-go": "OpenCode Go",
+  "opencode-zen": "OpenCode Zen",
+  "opencode-codex": "OpenCode Codex",
+  xai: "xAI / Grok",
+  "xai-oauth": "xAI / Grok (OAuth)",
+  bedrock: "AWS Bedrock",
+  "ai-gateway": "AI Gateway",
 };
 
 /**
@@ -315,6 +337,19 @@ export const PROVIDER_MODELS: Record<string, string[]> = {
     "google/gemini-3-pro-preview",
     "google/gemini-3-flash",
     "deepseek/deepseek-v3.2",
+  ],
+  xai: ["grok-4", "grok-4.20-beta", "grok-3.5"],
+  "xai-oauth": ["grok-4", "grok-4.20-beta", "grok-3.5"],
+  bedrock: [
+    "anthropic.claude-opus-4",
+    "anthropic.claude-sonnet-4",
+    "anthropic.claude-haiku-4",
+  ],
+  "opencode-codex": [
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
   ],
 };
 
