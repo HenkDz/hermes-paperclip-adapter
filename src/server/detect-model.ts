@@ -11,7 +11,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { MODEL_PREFIX_PROVIDER_HINTS, VALID_PROVIDERS } from "../shared/constants.js";
+import { MODEL_PREFIX_PROVIDER_HINTS } from "../shared/constants.js";
 
 export interface DetectedModel {
   /** Model name from config (e.g. "gpt-5.4", "anthropic/claude-sonnet-4") */
@@ -166,8 +166,7 @@ export function resolveProvider(options: {
   const normalizedModel = model?.trim().toLowerCase();
 
   // 1. Prefer an exact model+provider match from detected Hermes configs.
-  //    This lets us honor the selected profile config first, then fall back to
-  //    the default Hermes config for explicit model overrides.
+  //    Trust the config provider unconditionally — the CLI validates it.
   if (normalizedModel) {
     for (const detected of detectedConfigs) {
       const detectedProvider = detected?.provider?.trim();
@@ -175,7 +174,6 @@ export function resolveProvider(options: {
       if (
         detectedProvider &&
         detectedModel &&
-        (VALID_PROVIDERS as readonly string[]).includes(detectedProvider) &&
         detectedModel === normalizedModel
       ) {
         return {
