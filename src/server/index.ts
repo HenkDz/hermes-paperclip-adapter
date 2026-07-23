@@ -122,6 +122,12 @@ export function createServerAdapter(): ServerAdapterModule & {
             hint: "Isolated Hermes profile with its own config, memories, and skills.",
           },
           {
+            key: "cwd",
+            label: "Working Directory",
+            type: "text",
+            hint: "Optional absolute existing directory used as the Hermes process launch root.",
+          },
+          {
             key: "provider",
             label: "Provider",
             type: "select",

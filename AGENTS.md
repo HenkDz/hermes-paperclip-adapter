@@ -68,7 +68,7 @@ All implemented in `createServerAdapter()` return object in `src/server/index.ts
 | `syncSkills` | done | Syncs desired skills to Hermes profile |
 | `sessionCodec` | done | Validates sessionId only |
 | `models` | done | Static list from src/index.ts |
-| `getConfigSchema` | done | Profile (select), reasoning effort, memory scope, delivery target |
+| `getConfigSchema` | done | Profile, working directory, provider, memory scope, runtime limits, delivery target |
 | `agentConfigurationDoc` | done | Markdown doc for config form |
 | `supportsLocalAgentJwt` | done | `true` |
 
@@ -79,6 +79,7 @@ The adapter returns a `getConfigSchema()` method. Paperclip server serves this a
 | Key | Type | Options | Default | Notes |
 |-----|------|---------|---------|-------|
 | `profile` | select | Dynamic (from `~/.hermes/profiles/`) | `"default"` | Each agent gets isolated Hermes profile |
+| `cwd` | text | — | Paperclip service directory | Optional absolute existing Hermes process launch root |
 | `reasoningEffort` | select | low, medium, high | `"medium"` | `--reasoning-effort` flag |
 | `memoryScope` | select | session, persistent, ephemeral | `"session"` | Controls `--resume` behavior |
 | `quiet` | toggle | true/false | `true` | Recommended. Enables Hermes `-Q` quiet mode so transcripts and stored summaries do not echo the full prompt/banner |

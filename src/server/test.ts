@@ -10,6 +10,7 @@ import type {
   AdapterEnvironmentTestResult,
   AdapterEnvironmentCheck,
 } from "@paperclipai/adapter-utils";
+import { ensureAbsoluteDirectory } from "@paperclipai/adapter-utils/server-utils";
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -26,6 +27,30 @@ function asString(v: unknown): string | undefined {
 // ---------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------
+
+async function checkWorkingDirectory(
+  config: Record<string, unknown>,
+): Promise<AdapterEnvironmentCheck | null> {
+  const cwd = asString(config.cwd)?.trim();
+  if (!cwd) return null;
+
+  try {
+    await ensureAbsoluteDirectory(cwd);
+    return {
+      level: "info",
+      message: `Working directory: ${cwd}`,
+      code: "hermes_cwd_valid",
+    };
+  } catch (err: unknown) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      level: "error",
+      message: reason,
+      hint: "Choose an absolute path to an existing directory accessible to the Paperclip service user.",
+      code: "hermes_cwd_invalid",
+    };
+  }
+}
 
 async function checkCliInstalled(
   command: string,
@@ -285,7 +310,21 @@ export async function testEnvironment(
   const command = asString(config.hermesCommand) || HERMES_CLI;
   const checks: AdapterEnvironmentCheck[] = [];
 
-  // 1. CLI installed?
+  // 1. Configured working directory?
+  const cwdCheck = await checkWorkingDirectory(config);
+  if (cwdCheck) {
+    checks.push(cwdCheck);
+    if (cwdCheck.level === "error") {
+      return {
+        adapterType: ADAPTER_TYPE,
+        status: "fail",
+        checks,
+        testedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  // 2. CLI installed?
   const cliCheck = await checkCliInstalled(command);
   if (cliCheck) {
     checks.push(cliCheck);

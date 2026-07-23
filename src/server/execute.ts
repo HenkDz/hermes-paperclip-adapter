@@ -1191,12 +1191,11 @@ export async function execute(
   }
 
   // ── Resolve working directory ──────────────────────────────────────────
-  const cwd =
-    cfgString(ctx.config?.workspaceDir) || cfgString(config.cwd) || ".";
-  try {
+  const configuredCwd =
+    cfgString(ctx.config?.workspaceDir) || cfgString(config.cwd);
+  const cwd = configuredCwd || ".";
+  if (configuredCwd) {
     await ensureAbsoluteDirectory(cwd);
-  } catch {
-    // Non-fatal
   }
 
   // ── Report invocation metadata to Paperclip ───────────────────────────
