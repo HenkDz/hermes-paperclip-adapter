@@ -61,6 +61,7 @@ Leave blank to use the default profile.
 |-------|------|---------|-------------|
 | model | string | (Hermes configured default) | Optional explicit model in provider/model format. Leave blank to use Hermes's configured default model. |
 | provider | string | (auto) | API provider: auto, openrouter, nous, openai-codex, zai, kimi-coding, minimax, minimax-cn. Usually not needed — Hermes auto-detects from model name. |
+| cwd | string | (Paperclip service directory) | Optional absolute existing directory used as the Hermes process launch root. |
 | reasoningEffort | string | medium | Reasoning effort level: low, medium, high. Silently ignored by models that don't support it. Higher = more thorough but slower and more expensive. |
 | timeoutSec | number | 300 | Execution timeout in seconds |
 | graceSec | number | 10 | Grace period after SIGTERM before SIGKILL |

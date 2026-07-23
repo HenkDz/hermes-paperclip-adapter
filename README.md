@@ -180,6 +180,7 @@ Use one of these paths:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `profile` | string | `default` | Hermes profile name (isolated config, memories, skills) |
+| `cwd` | string | *(Paperclip service directory)* | Optional absolute existing directory used as the Hermes process launch root. |
 | `memoryScope` | string | `session` | `session` (resume within agent), `persistent` (survive recreation), `ephemeral` (fresh every run) |
 | `resumeStrategy` | string | `smart` | `smart` (decide based on failure), `always` (resume always), `never` (always fresh) |
 
